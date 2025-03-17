@@ -22,17 +22,18 @@ def main():
     model = VirtualNodePredictor(
         node_in_dim=node_in_dim,
         edge_in_dim=edge_in_dim,
-        hidden_dim=64,
+        hidden_dim=32,
         num_layers=2
     )
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+    optimizer = torch.optim.Adam(model.parameters(), lr=2e-3)
 
     # 3) 训练
-    epochs = 500
-    lambda_phy = 10.0  # 如果你在 train_step 里实现了 phy_loss，就会用到
+    epochs = 3000
     for epoch in range(epochs):
-        total_loss, node_loss, phy_loss = train_step(model, train_data, optimizer, lambda_child=lambda_phy)
-        if epoch % 5 == 0:
+        total_loss, node_loss, edge_loss, phy_loss = train_step(model, train_data, optimizer,
+                                                               lambda_edge=1.0, 
+                                                               lambda_phy=10.0)
+        if epoch % 10 == 0:
             print(f'[Epoch {epoch}] total={total_loss:.4f}, node={node_loss:.4f}, phy={phy_loss:.4f}')
 
     # 4) 加载测试集
@@ -47,7 +48,7 @@ def main():
     # 5) 测试阶段: 推断 node_probs
     model.eval()
     with torch.no_grad():
-        node_probs, _ = model(  # 我们这里不使用第二个返回值node_feats_pred
+        node_probs, _ ,_ = model(  
             test_data.x,
             test_data.edge_index,
             test_data.edge_attr,
@@ -75,7 +76,7 @@ def main():
 
     # 构造DataFrame
     df_data = {
-        'node_id'   : candidate_indices + 1,  # 如果你想以1-based输出，否则直接candidate_indices
+        'node_id'   : candidate_indices + 1
         'RealPart'  : real_parts,
         'ImagPart'  : imag_parts,
         'Magnitude' : magnitude,
@@ -95,7 +96,7 @@ def main():
     visualize_results(
         test_data,
         node_probs=node_probs,
-        node_feats_pred=None,  # 我们也可以不传embedding
+        node_feats_pred=None,
         iteration='test',
         threshold=0.5
     )
