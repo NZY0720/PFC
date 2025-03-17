@@ -4,7 +4,7 @@ import matplotlib.pyplot as plt
 import networkx as nx
 import os
 
-from constraints import power_flow_constraint  # 你贴出的版本
+from constraints import power_flow_constraint 
 
 def train_step(model, data, optimizer, lambda_edge=1.0, lambda_phy=10.0):
     model.train()
@@ -41,7 +41,6 @@ def train_step(model, data, optimizer, lambda_edge=1.0, lambda_phy=10.0):
 
     # 3) 物理约束损失 (phy_loss)
     #    node_feats_pred => [N,2], 其中 0,1列可以表示 (V_real, V_imag) 
-    #    如果你的模型输出不是 (V_real, V_imag)，请相应做转换
     phy_loss = power_flow_constraint(
         node_feats_pred,
         data.edge_index,
@@ -57,11 +56,6 @@ def train_step(model, data, optimizer, lambda_edge=1.0, lambda_phy=10.0):
     return total_loss.item(), node_loss.item(), edge_feat_loss.item(), phy_loss.item()
 
 def visualize_results(data, node_probs, node_feats_pred, iteration=0, threshold=0.5, save_path='./results'):
-    """
-    简单可视化: 
-      - known_nodes(浅蓝), pred_exist_nodes(绿色)
-      - 不处理 edge_probs
-    """
     G = nx.Graph()
     known_nodes = []
     if hasattr(data, 'node_known_mask'):
