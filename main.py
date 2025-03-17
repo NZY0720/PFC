@@ -1,66 +1,107 @@
-import torch, os
+import torch
+import os
 import pandas as pd
+
 from dataset import PowerGridDataset
 from model import VirtualNodePredictor
 from utils import train_step, visualize_results
 
 def main():
-    # 1) 加载数据
-    dataset = PowerGridDataset('./data/NodeVoltages.csv', './data/BranchFlows.csv')
-    data = dataset.load_data()
+    # 1) 加载训练集
+    train_dataset = PowerGridDataset(
+        node_path='./train_data/NodeVoltages.csv',
+        branch_path='./train_data/BranchFlows.csv',
+        hide_ratio=0.2,
+        is_train=True
+    )
+    train_data = train_dataset.load_data()
 
-    # 2) 初始化模型 & 优化器
-    node_in_dim = data.x.size(1)      # 例如4: [RealPart, ImagPart, Magnitude, Phase_deg]
-    edge_in_dim = data.edge_attr.size(1)  # 例如2: [S_Real, S_Imag]
-    model = VirtualNodePredictor(node_in_dim, edge_in_dim, hidden_dim=64, num_layers=3)
+    # 2) 创建模型 & 优化器
+    node_in_dim = train_data.x.size(1)  # 例如4
+    edge_in_dim = train_data.edge_attr.size(1) if train_data.edge_attr is not None else 0
+    model = VirtualNodePredictor(
+        node_in_dim=node_in_dim,
+        edge_in_dim=edge_in_dim,
+        hidden_dim=64,
+        num_layers=2
+    )
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
 
-    # 3) 训练超参
-    epochs = 200
-    iterations = 2
-    lambda_phy = 10.0
-    threshold = 0.5
+    # 3) 训练
+    epochs = 500
+    lambda_phy = 10.0  # 如果你在 train_step 里实现了 phy_loss，就会用到
+    for epoch in range(epochs):
+        total_loss, node_loss, phy_loss = train_step(model, train_data, optimizer, lambda_child=lambda_phy)
+        if epoch % 5 == 0:
+            print(f'[Epoch {epoch}] total={total_loss:.4f}, node={node_loss:.4f}, phy={phy_loss:.4f}')
 
-    save_path = './results'
-    os.makedirs(save_path, exist_ok=True)
+    # 4) 加载测试集
+    test_dataset = PowerGridDataset(
+        node_path='./test_data/NodeVoltages.csv',
+        branch_path='./test_data/BranchFlows.csv',
+        hide_ratio=0,
+        is_train=False
+    )
+    test_data = test_dataset.load_data()
 
-    # 4) 训练循环
-    for iteration in range(iterations):
-        print(f'--- Iteration {iteration+1}/{iterations} ---')
-        for epoch in range(epochs):
-            (total_loss, node_loss, edge_loss, feature_loss, phy_loss) = train_step(model, data, optimizer, lambda_phy)
-            print(f'[Iter {iteration+1} | Epoch {epoch}] '
-                  f'total={total_loss:.4f} | node={node_loss:.4f} | edge={edge_loss:.4f} '
-                  f'| feat={feature_loss:.4f} | phy={phy_loss:.4f}')
-
-        # 5) 可视化
-        model.eval()
-        with torch.no_grad():
-            node_probs, edge_probs, candidate_edges, node_feats_pred = model(
-                data.x, data.edge_index, data.edge_attr, data.candidate_nodes, data.candidate_edges
-            )
-
-        visualize_results(
-            data, node_probs, edge_probs, candidate_edges,
-            iteration=iteration+1, threshold=threshold, save_path=save_path
+    # 5) 测试阶段: 推断 node_probs
+    model.eval()
+    with torch.no_grad():
+        node_probs, _ = model(  # 我们这里不使用第二个返回值node_feats_pred
+            test_data.x,
+            test_data.edge_index,
+            test_data.edge_attr,
+            test_data.candidate_nodes
         )
 
-        # 6) 导出当前迭代下「预测节点特征 vs 真实节点特征」对比CSV
-        candidate_nodes = data.candidate_nodes
-        real_features = data.x[candidate_nodes, :2].cpu().numpy()      # (V_real, V_imag) 真实
-        pred_features = node_feats_pred[candidate_nodes].cpu().numpy() # (V_real_pred, V_imag_pred)
+    # 6) 保存 CSV，包括：NodeID, RealPart, ImagPart, Magnitude, Phase_deg, node_prob, (可选) label
+    candidate_indices = test_data.candidate_nodes.cpu().numpy()       # [num_candidate_nodes]
+    node_probs_np = node_probs.cpu().numpy()                          # [num_candidate_nodes]
 
-        df = pd.DataFrame({
-            'node_id': candidate_nodes.cpu().tolist(),
-            'v_real_pred': pred_features[:, 0],
-            'v_real_true': real_features[:, 0],
-            'v_imag_pred': pred_features[:, 1],
-            'v_imag_true': real_features[:, 1],
-        })
-        csv_path = os.path.join(save_path, f'feature_comparison_iter{iteration+1}.csv')
-        df.to_csv(csv_path, index=False)
-        print(f'==> Saved feature comparison CSV to: {csv_path}')
+    # 取原始特征 (形状: [N,4])，把它搬到CPU -> numpy
+    x_original = test_data.x.cpu().numpy()                            # [N,4]
 
+    # 逐个 candidate_node 找它对应的 4 维特征
+    # 例如: RealPart=x_original[node_id,0], ImagPart=x_original[node_id,1], ...
+    real_parts  = x_original[candidate_indices, 0]
+    imag_parts  = x_original[candidate_indices, 1]
+    magnitude   = x_original[candidate_indices, 2]
+    phase_deg   = x_original[candidate_indices, 3]
+
+    # 若有真实标签
+    labels = None
+    if hasattr(test_data, 'candidate_nodes_label'):
+        labels = test_data.candidate_nodes_label.cpu().numpy()  # [num_candidate_nodes]
+
+    # 构造DataFrame
+    df_data = {
+        'node_id'   : candidate_indices + 1,  # 如果你想以1-based输出，否则直接candidate_indices
+        'RealPart'  : real_parts,
+        'ImagPart'  : imag_parts,
+        'Magnitude' : magnitude,
+        'Phase_deg' : phase_deg,
+        'node_prob' : node_probs_np,
+    }
+    if labels is not None:
+        df_data['label'] = labels
+
+    df = pd.DataFrame(df_data)
+
+    out_csv = './results/test_predictions.csv'
+    df.to_csv(out_csv, index=False)
+    print(f"[INFO] 已保存测试结果到 {out_csv}")
+
+    # 7) 可视化
+    visualize_results(
+        test_data,
+        node_probs=node_probs,
+        node_feats_pred=None,  # 我们也可以不传embedding
+        iteration='test',
+        threshold=0.5
+    )
+
+    print("Done.")
 
 if __name__ == '__main__':
+    os.makedirs('./results', exist_ok=True)
     main()
