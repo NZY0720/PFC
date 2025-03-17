@@ -21,28 +21,27 @@ class GraphormerMultiHeadAttention(nn.Module):
         self.out_proj = nn.Linear(embed_dim, embed_dim)
         self.attn_drop = nn.Dropout(dropout)
 
-        # 如果edge_attr是2维 (S_real,S_imag)，则in_features=2
-        # 如果edge_attr是3维，就写3
-        self.edge_bias_proj = nn.Linear(2, num_heads)
+        # NOTE: now we do edge_bias_proj = nn.Linear(4, num_heads)
+        # because edge_attr has shape [E,4]
+        self.edge_bias_proj = nn.Linear(4, num_heads)
 
     def forward(self, x, edge_index=None, edge_attr=None, batch=None):
+        # 1) Q,K,V
         Q = self.q_proj(x)
         K = self.k_proj(x)
         V = self.v_proj(x)
 
-        # 多头拆分
         Q = Q.view(-1, self.num_heads, self.head_dim).transpose(0,1)
         K = K.view(-1, self.num_heads, self.head_dim).transpose(0,1)
         V = V.view(-1, self.num_heads, self.head_dim).transpose(0,1)
 
         scores = torch.matmul(Q, K.transpose(-2,-1)) / (self.head_dim**0.5)
 
-        # Edge bias
         if edge_index is not None and edge_attr is not None:
             E = edge_index.size(1)
-            edge_bias = self.edge_bias_proj(edge_attr)  # [E, num_heads]
-            edge_bias = edge_bias.transpose(0,1)        # [num_heads, E]
-            # 构造一个 [num_heads, N, N]
+            # shape [E,4] => project to [E,num_heads]
+            edge_bias = self.edge_bias_proj(edge_attr)  # => [E, num_heads]
+            edge_bias = edge_bias.transpose(0,1)        # => [num_heads, E]
             N = x.size(0)
             edge_bias_full = torch.zeros(self.num_heads, N, N, device=x.device)
             for h in range(self.num_heads):
@@ -54,16 +53,14 @@ class GraphormerMultiHeadAttention(nn.Module):
             scores = scores + edge_bias_full
 
         if batch is not None:
-            # 防止跨图 attention
+            # mask cross-graph
             N = x.size(0)
             batch_i = batch.unsqueeze(0).unsqueeze(0).expand(self.num_heads, -1, -1)
             batch_j = batch_i.transpose(1,2)
-            mask = (batch_i == batch_j).float()
-            scores = scores.masked_fill(mask==0, float('-inf'))
+            scores = scores.masked_fill((batch_i!=batch_j), float('-inf'))
 
         attn = F.softmax(scores, dim=-1)
         attn = self.attn_drop(attn)
-
         out = torch.matmul(attn, V)
         out = out.transpose(0,1).contiguous().view(-1, self.embed_dim)
         out = self.out_proj(out)
@@ -115,63 +112,48 @@ class Graphormer(nn.Module):
 #    - Outputs node_probs (existence) 
 #    - Outputs node_feats_pred = (V_real, V_imag) for each node
 ###############################################################################
-
 class VirtualNodePredictor(nn.Module):
     """
-    让 Graphormer 输出 hidden_dim(中间表示),
-    再接 2个头:
-      - node_exist_head => [N,1] => 二分类 => node_probs
-      - node_feature_head => [N,2] => (V_real, V_imag) 便于潮流约束
+    A simplified model:
+      1) node_probs => node label=0/1
+      2) node_feats_pred => (V_real,V_imag)
+      3) edge_feature_head => predict (VdiffR, VdiffI, S_real, S_imag) 
+         only if child label=1
     """
-    def __init__(self,
-                 node_in_dim,
-                 edge_in_dim,
-                 hidden_dim=64,
-                 num_layers=3,
-                 num_heads=4,
-                 dropout=0.1):
+    def __init__(self, node_in_dim, edge_in_dim, hidden_dim=64, num_layers=3):
         super().__init__()
         self.hidden_dim = hidden_dim
-
-        # Graphormer主体
-        self.encoder = Graphormer(
-            input_dim=node_in_dim,
-            hidden_dim=hidden_dim,
-            num_heads=num_heads,
-            num_layers=num_layers,
-            dropout=dropout
+        # a trivial encoder => node_emb
+        self.encoder = nn.Sequential(
+            nn.Linear(node_in_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim)
         )
-
-        # 节点存在预测 (二分类)
+        # node_exist => [N,1]
         self.node_exist_head = nn.Linear(hidden_dim, 1)
-
-        # 节点特征预测 => (V_real, V_imag)
+        # node_feature => [N,2]
         self.node_feature_head = nn.Linear(hidden_dim, 2)
+        # edge_feature => [2*hidden_dim ->4]
+        self.edge_feature_head = nn.Sequential(
+            nn.Linear(2*hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 4)
+        )
 
     def forward(self, x, edge_index, edge_attr, candidate_nodes):
         """
-        x: [N, node_in_dim]
-        edge_index: [2, E]
-        edge_attr: [E, edge_in_dim] (e.g. 2 => S_real,S_imag)
-        candidate_nodes: [num_candidate_nodes]
-        Return:
-          node_probs: shape [num_candidate_nodes], Sigmoid( node_scores )
-          node_feats_pred: shape [N,2], interpreted as (V_real, V_imag)
+        x => shape [N, node_in_dim]
+        Return => node_probs: [num_candidate_nodes], node_feats_pred: [N,2], node_emb: [N,hidden_dim]
+        We'll do edge feature predictions in train_step 
         """
-        device = x.device
-        N = x.size(0)
+        node_emb = self.encoder(x)  # [N, hidden_dim]
 
-        # 构建 batch=0, 并可计算 degree(若需要)
-        batch = torch.zeros(N, dtype=torch.long, device=device)  # 仅单图
+        # node_probs
+        node_scores = self.node_exist_head(node_emb).squeeze(-1)
+        node_probs  = torch.sigmoid(node_scores[candidate_nodes])
 
-        # 送进Graphormer => [N, hidden_dim]
-        h = self.encoder(x, edge_index=edge_index, edge_attr=edge_attr, batch=batch)
+        # node_feats => (V_real, V_imag)
+        node_feats_pred = self.node_feature_head(node_emb) # [N,2]
 
-        # 1) 节点存在 => node_probs
-        node_scores = self.node_exist_head(h).squeeze(-1)  # [N]
-        node_probs = torch.sigmoid(node_scores[candidate_nodes])  # [num_candidate_nodes]
+        return node_probs, node_feats_pred, node_emb
 
-        # 2) 节点潮流特征 => (V_real, V_imag)
-        node_feats_pred = self.node_feature_head(h)  # [N, 2]
-
-        return node_probs, node_feats_pred
