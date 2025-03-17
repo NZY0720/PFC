@@ -1,34 +1,46 @@
 import torch
 
 def power_flow_constraint(
-    node_feats_pred,   
-    edge_index,
-    edge_attr,
+    node_feats_pred,   # [N,2], interpret as (V_real, V_imag)
+    edge_index,        # [2,E]
+    edge_attr,         # [E,4] => [Vdiff_Real, Vdiff_Imag, S_Real, S_Imag]
     candidate_nodes,
     candidate_nodes_label,
     lambda_child=1.0
 ):
-    
+    # node_feats_pred => (V_real, V_imag)
+    V_real = node_feats_pred[:,0]
+    V_imag = node_feats_pred[:,1]
+
     src = edge_index[0]
     tgt = edge_index[1]
 
-    V_real = node_feats_pred[:,0]
-    V_imag = node_feats_pred[:,1]
-    V_real_src, V_imag_src = V_real[src], V_imag[src]
-    V_real_tgt, V_imag_tgt = V_real[tgt], V_imag[tgt]
+    V_real_src = V_real[src]
+    V_imag_src = V_imag[src]
+    V_real_tgt = V_real[tgt]
+    V_imag_tgt = V_imag[tgt]
 
+    # 真实值
+    Vdiff_Real_true = edge_attr[:,0]
+    Vdiff_Imag_true = edge_attr[:,1]
+    S_real_true     = edge_attr[:,2]
+    S_imag_true     = edge_attr[:,3]
+
+    # 预测值 => 电压差
+    Vdiff_Real_pred = V_real_src - V_real_tgt
+    Vdiff_Imag_pred = V_imag_src - V_imag_tgt
+    Vdiff_loss = (Vdiff_Real_pred - Vdiff_Real_true)**2 + (Vdiff_Imag_pred - Vdiff_Imag_true)**2
+
+    # 预测值 => 潮流
     S_real_pred = V_real_src * V_real_tgt + V_imag_src * V_imag_tgt
     S_imag_pred = V_imag_src * V_real_tgt - V_real_src * V_imag_tgt
+    S_loss = (S_real_pred - S_real_true)**2 + (S_imag_pred - S_imag_true)**2
 
-    S_real_true = edge_attr[:,0]
-    S_imag_true = edge_attr[:,1]
+    all_loss = Vdiff_loss + S_loss  # shape = [E]
 
-    
-    all_loss = (S_real_pred - S_real_true)**2 + (S_imag_pred - S_imag_true)**2
-   
-    candi_label_1 = set(
-        candidate_nodes[(candidate_nodes_label == 1)].tolist()
-    )
+    # 区分父-父 vs 父-子:
+    # 以 father-子: (src in candidate_label=1) or (tgt in candidate_label=1)
+    candi_label_1 = set(candidate_nodes[(candidate_nodes_label==1)].tolist())
     child_mask = []
     for i in range(edge_index.size(1)):
         s = src[i].item()
@@ -37,11 +49,12 @@ def power_flow_constraint(
             child_mask.append(True)
         else:
             child_mask.append(False)
-
     child_mask = torch.tensor(child_mask, dtype=torch.bool, device=all_loss.device)
 
-    loss_father_father = torch.mean(all_loss[~child_mask])  
-    loss_father_child  = torch.mean(all_loss[child_mask])   
-    loss = loss_father_father + lambda_child*loss_father_child
+    # father-father
+    loss_father_father = torch.mean(all_loss[~child_mask]) if (~child_mask).any() else 0.0
+    # father-child
+    loss_father_child  = torch.mean(all_loss[child_mask])  if (child_mask).any()  else 0.0
 
+    loss = loss_father_father + lambda_child * loss_father_child
     return loss
