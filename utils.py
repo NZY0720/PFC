@@ -6,48 +6,55 @@ import os
 
 from constraints import power_flow_constraint  # 你贴出的版本
 
-def train_step(model, data, optimizer, lambda_child=1.0):
-    """
-    单次训练:
-      - 前向 => (node_probs, node_feats_pred)
-      - BCE(node_probs, candidate_nodes_label)
-      - phy_loss => power_flow_constraint(node_feats_pred, data, ...)
-      - total_loss => sum
-    """
+def train_step(model, data, optimizer, lambda_edge=1.0, lambda_phy=10.0):
     model.train()
     optimizer.zero_grad()
 
-    # forward
-    node_probs, node_feats_pred = model(
+    # forward => (node_probs, node_feats_pred, node_emb)
+    node_probs, node_feats_pred, node_emb = model(
         data.x,
         data.edge_index,
         data.edge_attr,
         data.candidate_nodes
     )
-    # 1) 节点二分类损失
-    node_loss = torch.tensor(0.0, device=data.x.device)
-    if hasattr(data, 'candidate_nodes_label'):
-        node_loss = F.binary_cross_entropy(node_probs, data.candidate_nodes_label.float())
 
-    # 2) 潮流约束 => power_flow_constraint
-    #   node_feats_pred形状 [N,2], interpret as V_real, V_imag
-    phy_loss = torch.tensor(0.0, device=data.x.device)
-    if data.edge_index is not None and data.edge_attr is not None:
-        # 传入 candidate_nodes和candidate_nodes_label, 以区分父-子
-        phy_loss = power_flow_constraint(
-            node_feats_pred,
-            data.edge_index,
-            data.edge_attr,
-            data.candidate_nodes,
-            data.candidate_nodes_label,
-            lambda_child=1.0   # 若想加大对父-子边的约束，可改
-        )
+    # 1) 节点loss(BCE)
+    node_loss = F.binary_cross_entropy(node_probs, data.candidate_nodes_label.float())
 
-    total_loss = node_loss + lambda_child * phy_loss
+    # 2) 边特征回归 loss（示例，与原代码保持一致）
+    edge_feat_loss = torch.tensor(0.0, device=data.x.device)
+    if hasattr(data, 'fc_edges') and hasattr(data, 'fc_attr'):
+        fc_edges = data.fc_edges  # [2, fc_count]
+        fc_attr  = data.fc_attr   # [fc_count,4]
+        mask = (data.candidate_nodes_label==1)  # 只对label=1的child进行回归
+        if mask.any():
+            father_idx    = fc_edges[0, mask]
+            child_idx     = fc_edges[1, mask]
+            fc_attr_sel   = fc_attr[mask]
+
+            father_emb = node_emb[father_idx]    # [sum(mask), hidden_dim]
+            child_emb  = node_emb[child_idx]     # [sum(mask), hidden_dim]
+            edge_in    = torch.cat([father_emb, child_emb], dim=1)  # => [sum(mask), 2*hidden_dim]
+            pred_edge_feat = model.edge_feature_head(edge_in)        # => [sum(mask),4]
+
+            edge_feat_loss = F.mse_loss(pred_edge_feat, fc_attr_sel)
+
+    # 3) 物理约束损失 (phy_loss)
+    #    node_feats_pred => [N,2], 其中 0,1列可以表示 (V_real, V_imag) 
+    #    如果你的模型输出不是 (V_real, V_imag)，请相应做转换
+    phy_loss = power_flow_constraint(
+        node_feats_pred,
+        data.edge_index,
+        data.edge_attr,
+        data.candidate_nodes,
+        data.candidate_nodes_label
+    )
+
+    total_loss = node_loss + lambda_edge*edge_feat_loss + lambda_phy*phy_loss
     total_loss.backward()
     optimizer.step()
 
-    return total_loss.item(), node_loss.item(), phy_loss.item()
+    return total_loss.item(), node_loss.item(), edge_feat_loss.item(), phy_loss.item()
 
 def visualize_results(data, node_probs, node_feats_pred, iteration=0, threshold=0.5, save_path='./results'):
     """
