@@ -1,4 +1,4 @@
-# Temporal Power Grid Analysis
+# Power Flow Calculation undr Incomplete Topology
 
 ![Power Grid Network](https://i.imgur.com/placeholder-image.png)
 
