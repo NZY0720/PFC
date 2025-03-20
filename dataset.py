@@ -170,7 +170,7 @@ class TemporalPowerGridDataset(Dataset):
 
     def _prepare_pyg_data(self, time_step, node_features, edge_features, hidden_nodes=None):
         """
-        Prepare PyTorch Geometric data object for a specific time step
+        Prepare PyTorch Geometric data object for a specific time step with a single virtual child node
         
         Args:
             time_step: Time step index
@@ -250,20 +250,18 @@ class TemporalPowerGridDataset(Dataset):
                 real_labels.append(1 if has_hidden_neighbor else 0)
             real_labels = torch.tensor(real_labels, dtype=torch.long)
             
-            # Create features for real and fake children
+            # Create features for real child
             child_feats_real = father_feats.clone()
-            child_feats_fake = torch.zeros_like(father_feats)
             fake_labels = torch.zeros(Nf, dtype=torch.long)
             
             # Combine features for all nodes
-            node_features_combined = torch.cat([father_feats, child_feats_real, child_feats_fake], dim=0)
-            total_num_nodes = 3 * Nf
+            node_features_combined = torch.cat([father_feats, child_feats_real], dim=0)
+            total_num_nodes = 2 * Nf
             
             # Create indices for candidate nodes
             candidate_real_nodes = torch.arange(Nf, 2 * Nf)
-            candidate_fake_nodes = torch.arange(2 * Nf, 3 * Nf)
-            candidate_nodes = torch.cat([candidate_real_nodes, candidate_fake_nodes], dim=0)
-            candidate_nodes_label = torch.cat([real_labels, fake_labels], dim=0)
+            candidate_nodes = candidate_real_nodes
+            candidate_nodes_label = real_labels
             
             # Create time index for all nodes (including candidates)
             time_index_combined = torch.full((total_num_nodes,), time_step, dtype=torch.long)
@@ -306,16 +304,6 @@ class TemporalPowerGridDataset(Dataset):
             fc_edges_real = torch.tensor(fc_edges_real, dtype=torch.long).T
             fc_attr_real = torch.tensor(fc_attr_real, dtype=torch.float)
             
-            # Create fake child edges
-            fc_edges_fake = []
-            fc_attr_fake = []
-            for i in range(Nf):
-                fc_edges_fake.append((i, 2 * Nf + i))
-                fc_attr_fake.append([0, 0, 0, 0])
-            
-            fc_edges_fake = torch.tensor(fc_edges_fake, dtype=torch.long).T
-            fc_attr_fake = torch.tensor(fc_attr_fake, dtype=torch.float)
-            
             # Filter original edges to keep only father-father edges
             father_edges = []
             father_attrs = []
@@ -333,8 +321,8 @@ class TemporalPowerGridDataset(Dataset):
             father_attrs = torch.tensor(father_attrs, dtype=torch.float) if father_attrs else torch.zeros((0, 4), dtype=torch.float)
             
             # Combine all edges
-            new_edge_index = torch.cat([father_edges, fc_edges_real, fc_edges_fake], dim=1) if father_edges.size(1) > 0 else torch.cat([fc_edges_real, fc_edges_fake], dim=1)
-            new_edge_attr = torch.cat([father_attrs, fc_attr_real, fc_attr_fake], dim=0) if father_attrs.size(0) > 0 else torch.cat([fc_attr_real, fc_attr_fake], dim=0)
+            new_edge_index = torch.cat([father_edges, fc_edges_real], dim=1) if father_edges.size(1) > 0 else fc_edges_real
+            new_edge_attr = torch.cat([father_attrs, fc_attr_real], dim=0) if father_attrs.size(0) > 0 else fc_attr_real
             
             # Create mask for known nodes
             node_known_mask = torch.zeros(total_num_nodes, dtype=torch.bool)
@@ -348,10 +336,6 @@ class TemporalPowerGridDataset(Dataset):
             known_S_real = new_edge_attr[:, 2]
             known_S_imag = new_edge_attr[:, 3]
             
-            # Combine father-child edges
-            fc_edges = torch.cat([fc_edges_real, fc_edges_fake], dim=1)
-            fc_attr = torch.cat([fc_attr_real, fc_attr_fake], dim=0)
-            
             # Create PyG data object
             data = Data(
                 x=node_features_combined,
@@ -364,8 +348,8 @@ class TemporalPowerGridDataset(Dataset):
                 V_imag=V_imag,
                 known_S_real=known_S_real,
                 known_S_imag=known_S_imag,
-                fc_edges=fc_edges,
-                fc_attr=fc_attr,
+                fc_edges=fc_edges_real,
+                fc_attr=fc_attr_real,
                 time_index=time_index_combined,
                 time_step=torch.tensor([time_step], dtype=torch.long)
             )
