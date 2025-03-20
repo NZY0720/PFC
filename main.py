@@ -59,7 +59,7 @@ def train(model, train_dataset, optimizer, device, epochs=3000, sequence_length=
                       f"Temporal: {loss_dict['temporal_loss']:.4f}")
                 
                 # Visualize intermediate results
-                if i == 0 and epoch % 100 == 0:
+                if i == 0 and epoch % 5 == 0:
                     model.eval()
                     with torch.no_grad():
                         node_probs_seq = []
@@ -273,7 +273,7 @@ if __name__ == '__main__':
                         help='Directory containing test data')
     parser.add_argument('--mode', type=str, choices=['train', 'test', 'both'], default='both',
                         help='Operation mode: train, test, or both')
-    parser.add_argument('--epochs', type=int, default=3000, help='Number of training epochs')
+    parser.add_argument('--epochs', type=int, default=20, help='Number of training epochs')
     parser.add_argument('--learning_rate', type=float, default=0.001, help='Learning rate')
     parser.add_argument('--hide_ratio', type=float, default=0.2, help='Ratio of nodes to hide')
     parser.add_argument('--sequence_length', type=int, default=3, 
