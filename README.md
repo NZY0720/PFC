@@ -129,12 +129,7 @@ For faster training, consider:
 If you use this code for your research, please cite:
 
 ```
-@article{temporalpowergrid2023,
-  title={Temporal Graph Neural Networks for Hidden Node Prediction in Power Grids},
-  author={Your Name},
-  journal={Journal of Example},
-  year={2023}
-}
+awaiting...
 ```
 
 ## License
