@@ -42,7 +42,7 @@ def train(model, train_dataset, optimizer, device, epochs=3000, sequence_length=
                 data_sequence, 
                 optimizer,
                 lambda_edge=1.0,
-                lambda_phy=10.0,
+                lambda_phy=1.0,
                 lambda_temporal=1.0
             )
             
@@ -111,6 +111,8 @@ def test(model, test_dataset, device, sequence_length=3):
     
     # Track metrics
     all_results = []
+    total_correct = 0
+    total_predictions = 0
     
     with torch.no_grad():
         for i, data_sequence in enumerate(test_loader):
@@ -138,8 +140,14 @@ def test(model, test_dataset, device, sequence_length=3):
                 y_pred = (node_probs >= 0.5).float()
                 y_true = data.candidate_nodes_label.float()
                 
-                # Accuracy
-                accuracy = (y_pred == y_true).float().mean().item()
+                # Update accuracy counts
+                batch_correct = (y_pred == y_true).sum().item()
+                batch_total = len(y_true)
+                total_correct += batch_correct
+                total_predictions += batch_total
+                
+                # Calculate accuracy for this batch
+                batch_accuracy = batch_correct / batch_total if batch_total > 0 else 0
                 
                 # Track results for each candidate node
                 for j, (prob, pred, true) in enumerate(zip(node_probs.cpu().numpy(), 
@@ -158,7 +166,7 @@ def test(model, test_dataset, device, sequence_length=3):
                         'true': true,
                         'v_real_pred': v_real_pred,
                         'v_imag_pred': v_imag_pred,
-                        'accuracy': accuracy
+                        'batch_accuracy': batch_accuracy  # Changed to 'batch_accuracy'
                     }
                     all_results.append(result)
             
@@ -173,13 +181,18 @@ def test(model, test_dataset, device, sequence_length=3):
                     save_path='./results/test'
                 )
     
+    # Calculate overall accuracy
+    overall_accuracy = total_correct / total_predictions if total_predictions > 0 else 0
+    
     # Convert results to DataFrame and save
     results_df = pd.DataFrame(all_results)
     results_df.to_csv('./results/test_predictions.csv', index=False)
     
     # Compute and print overall metrics
-    accuracy = results_df['accuracy'].mean()
-    print(f"Test Accuracy: {accuracy:.4f}")
+    print(f"Test Accuracy: {overall_accuracy:.4f}")
+    
+    # Add overall accuracy to the results for reference
+    # Don't try to use the 'accuracy' column anymore
     
     return results_df
 
@@ -193,14 +206,19 @@ def main(args):
     os.makedirs('./results/train', exist_ok=True)
     os.makedirs('./results/test', exist_ok=True)
     
-    # 1) Create datasets
+    # 设置最大时间步数，基于是否使用小时级别的数据
+    max_time_steps = 24 if args.hourly else 1440
+    print(f"Using {'hourly' if args.hourly else 'minute-by-minute'} data with {max_time_steps} time steps")
+    
+    # 1) 创建数据集，现在包含hourly参数
     print("Loading training dataset...")
     train_dataset = TemporalPowerGridDataset(
         data_dir=args.train_dir,
         hide_ratio=args.hide_ratio,
         is_train=True,
-        max_time_steps=args.max_time_steps,
-        sequence_length=args.sequence_length
+        max_time_steps=max_time_steps,
+        sequence_length=args.sequence_length,
+        hourly=args.hourly  # 新增参数
     )
     
     print("Loading test dataset...")
@@ -208,35 +226,36 @@ def main(args):
         data_dir=args.test_dir,
         hide_ratio=args.hide_ratio,
         is_train=False,
-        max_time_steps=args.max_time_steps,
-        sequence_length=args.sequence_length
+        max_time_steps=max_time_steps,
+        sequence_length=args.sequence_length,
+        hourly=args.hourly  # 新增参数
     )
     
-    # Check dataset
+    # 检查数据集
     sample_seq = train_dataset[0]
     print(f"Sample sequence length: {len(sample_seq)}")
     sample_data = sample_seq[0]
     print(f"Sample data: {sample_data}")
     print(f"Node features shape: {sample_data.x.shape}")
     
-    # 2) Create model
+    # 2) 创建模型 - 更新模型中的max_time_steps
     node_in_dim = sample_data.x.size(1)
     edge_in_dim = sample_data.edge_attr.size(1) if sample_data.edge_attr is not None else 0
     
     model = TemporalVirtualNodePredictor(
         node_in_dim=node_in_dim,
         edge_in_dim=edge_in_dim,
-        hidden_dim=64,
-        num_layers=3,
+        hidden_dim=128,
+        num_layers=4,
         num_heads=4,
-        max_time_steps=args.max_time_steps,
+        max_time_steps=max_time_steps,  # 更新时间步数
         dropout=0.1
     ).to(device)
     
-    # 3) Create optimizer
+    # 3) 创建优化器
     optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate)
     
-    # 4) Training
+    # 4) 训练
     if args.mode == 'train' or args.mode == 'both':
         print("Starting training...")
         trained_model = train(
@@ -248,9 +267,9 @@ def main(args):
             sequence_length=args.sequence_length
         )
     
-    # 5) Testing
+    # 5) 测试
     if args.mode == 'test' or args.mode == 'both':
-        # Load best model if testing only
+        # 如果仅测试，则加载最佳模型
         if args.mode == 'test':
             print("Loading best model...")
             model.load_state_dict(torch.load('./results/best_model.pth'))
@@ -267,19 +286,19 @@ def main(args):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Temporal Power Grid Analysis')
-    parser.add_argument('--train_dir', type=str, default='./train_data/Node_666', 
-                        help='Directory containing training data')
-    parser.add_argument('--test_dir', type=str, default='./test_data/Node_666', 
-                        help='Directory containing test data')
+    parser.add_argument('--train_dir', type=str, default='./train_data', 
+                        help='Directory containing training data with HHMM CSV files')
+    parser.add_argument('--test_dir', type=str, default='./test_data', 
+                        help='Directory containing test data with HHMM CSV files')
     parser.add_argument('--mode', type=str, choices=['train', 'test', 'both'], default='both',
                         help='Operation mode: train, test, or both')
-    parser.add_argument('--epochs', type=int, default=20, help='Number of training epochs')
+    parser.add_argument('--epochs', type=int, default=11, help='Number of training epochs')
     parser.add_argument('--learning_rate', type=float, default=0.001, help='Learning rate')
-    parser.add_argument('--hide_ratio', type=float, default=0.2, help='Ratio of nodes to hide')
+    parser.add_argument('--hide_ratio', type=float, default=0.1, help='Ratio of nodes to hide')
     parser.add_argument('--sequence_length', type=int, default=3, 
                         help='Number of consecutive time steps in each sequence')
-    parser.add_argument('--max_time_steps', type=int, default=24, 
-                        help='Maximum number of time steps in the dataset')
+    parser.add_argument('--hourly', action='store_true', default=True,
+                        help='If set, only use data from hourly intervals (HH00)')
     
     args = parser.parse_args()
     main(args)
