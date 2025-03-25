@@ -8,16 +8,17 @@ from torch_geometric.data import Data
 from torch.utils.data import Dataset
 
 class TemporalPowerGridDataset(Dataset):
-    def __init__(self, data_dir, hide_ratio=0.2, is_train=True, max_time_steps=24, sequence_length=1):
+    def __init__(self, data_dir, hide_ratio=0.2, is_train=True, max_time_steps=1440, sequence_length=1, hourly=False):
         """
-        Temporal dataset for power grid data
+        Temporal dataset for power grid data with the new format
         
         Args:
-            data_dir: Directory containing Imeas_data_*.csv and Vmeas_data_*.csv files
+            data_dir: Directory containing time-based CSV files (HHMM_line_currents.csv and HHMM_node_voltages.csv)
             hide_ratio: Percentage of lowest-degree nodes to hide
             is_train: If True, generate training data with real/fake child nodes; otherwise testing data
-            max_time_steps: Maximum number of time steps in the dataset
-            sequence_length: Number of consecutive time steps to include in each sample
+            max_time_steps: Maximum number of time steps in the dataset (default: 1440 for 24hrs in minutes)
+            sequence_length: Number of consecutive time steps in each sample
+            hourly: If True, only use data from hourly intervals (HH00 files)
         """
         super().__init__()
         self.data_dir = data_dir
@@ -25,12 +26,13 @@ class TemporalPowerGridDataset(Dataset):
         self.is_train = is_train
         self.max_time_steps = max_time_steps
         self.sequence_length = sequence_length
+        self.hourly = hourly
         
         # Find all data files
-        self.i_data_paths = sorted(glob.glob(os.path.join(data_dir, 'Imeas_data_*.csv')))
-        self.v_data_paths = sorted(glob.glob(os.path.join(data_dir, 'Vmeas_data_*.csv')))
+        self.line_current_paths = sorted(glob.glob(os.path.join(data_dir, '????_line_currents.csv')))
+        self.node_voltage_paths = sorted(glob.glob(os.path.join(data_dir, '????_node_voltages.csv')))
         
-        if not self.i_data_paths or not self.v_data_paths:
+        if not self.line_current_paths or not self.node_voltage_paths:
             raise ValueError(f"No data files found in {data_dir}")
         
         # Extract time steps from file names
@@ -47,24 +49,38 @@ class TemporalPowerGridDataset(Dataset):
         self.data_cache = {}
 
     def _extract_time_steps(self):
-        """Extract time step indices from file names"""
+        """Extract time step indices from file names (HHMM format)"""
         time_steps = []
-        for path in self.i_data_paths:
-            # Extract number from filename (e.g., Imeas_data_5.csv -> 5)
-            match = re.search(r'Imeas_data_(\d+)\.csv', os.path.basename(path))
+        for path in self.line_current_paths:
+            # Extract HHMM from filename (e.g., 0000_line_currents.csv -> 0000)
+            match = re.search(r'(\d{4})_line_currents\.csv', os.path.basename(path))
             if match:
-                time_steps.append(int(match.group(1)))
-        return sorted(time_steps)
+                time_str = match.group(1)
+                
+                # If hourly option is enabled, only include files with minutes="00"
+                if self.hourly and time_str[2:] != "00":
+                    continue
+                    
+                # Convert HHMM to minutes since midnight for numerical ordering
+                hours = int(time_str[:2])
+                minutes = int(time_str[2:])
+                time_minutes = hours * 60 + minutes
+                time_steps.append((time_str, time_minutes))
+        
+        # Sort by minutes and return the original time strings
+        sorted_time_steps = [t[0] for t in sorted(time_steps, key=lambda x: x[1])]
+        
+        if self.hourly:
+            print(f"Hourly mode enabled. Using {len(sorted_time_steps)} hourly time steps.")
+        
+        return sorted_time_steps
 
-    def _parse_complex(self, complex_str):
-        """Parse complex numbers from string format like '1.03-0.01i'"""
-        pattern = r'([-+]?\d*\.?\d+(?:e[-+]?\d+)?)([-+]\d*\.?\d+(?:e[-+]?\d+)?i)'
-        match = re.match(pattern, complex_str)
-        if match:
-            real = float(match.group(1))
-            imag = float(match.group(2).replace('i', ''))
-            return real, imag
-        return 0, 0  # Default if parsing fails
+    def _parse_complex_from_mag_ang(self, magnitude, angle_deg):
+        """Convert magnitude and angle (in degrees) to complex number components"""
+        angle_rad = np.radians(angle_deg)
+        real = magnitude * np.cos(angle_rad)
+        imag = magnitude * np.sin(angle_rad)
+        return real, imag
 
     def _initialize_dataset(self):
         """Initialize dataset by loading the first time step to get node and branch info"""
@@ -74,79 +90,96 @@ class TemporalPowerGridDataset(Dataset):
         # Load first time step to get structure
         if self.time_steps:
             t = self.time_steps[0]
-            i_path = os.path.join(self.data_dir, f'Imeas_data_{t}.csv')
-            v_path = os.path.join(self.data_dir, f'Vmeas_data_{t}.csv')
+            line_path = os.path.join(self.data_dir, f'{t}_line_currents.csv')
+            node_path = os.path.join(self.data_dir, f'{t}_node_voltages.csv')
             
-            if os.path.exists(i_path) and os.path.exists(v_path):
-                i_df = pd.read_csv(i_path)
-                v_df = pd.read_csv(v_path)
+            if os.path.exists(line_path) and os.path.exists(node_path):
+                line_df = pd.read_csv(line_path)
+                node_df = pd.read_csv(node_path)
                 
-                # Collect all node IDs
-                for node_id in v_df['Node_ID']:
+                # Collect all node IDs - handle non-numeric IDs
+                for node_id in node_df['Node']:
                     self.node_ids.add(node_id)
                 
-                # Collect all branch IDs
-                for branch_id in i_df['Branch_ID']:
-                    self.branch_ids.add(branch_id)
-                    
-                # Extract node pairs from branch IDs
+                # Collect all branch IDs and extract node pairs
                 self.branch_to_nodes = {}
-                for branch_id in self.branch_ids:
-                    from_node, to_node = map(int, branch_id.split('_'))
-                    self.branch_to_nodes[branch_id] = (from_node, to_node)
+                for _, row in line_df.iterrows():
+                    branch_id = row['Line']
+                    # Parse branch_id to get from_node and to_node
+                    # New format can include non-numeric IDs like "114->R1"
+                    match = re.match(r'(.+)->(.+)', branch_id)
+                    if match:
+                        from_node = match.group(1)
+                        to_node = match.group(2)
+                        self.branch_ids.add(branch_id)
+                        self.branch_to_nodes[branch_id] = (from_node, to_node)
+                    elif '->' in branch_id:
+                        # Fallback if regex doesn't match but arrow is present
+                        parts = branch_id.split('->')
+                        if len(parts) == 2:
+                            from_node, to_node = parts
+                            self.branch_ids.add(branch_id)
+                            self.branch_to_nodes[branch_id] = (from_node, to_node)
                 
-                # Create mapping from node ID to index
-                self.node_id_to_idx = {node_id: idx for idx, node_id in enumerate(sorted(list(self.node_ids)))}
+                # Create mapping from node ID to index - handle non-numeric IDs
+                sorted_nodes = sorted(list(self.node_ids), key=lambda x: str(x))  # Sort as strings
+                self.node_id_to_idx = {node_id: idx for idx, node_id in enumerate(sorted_nodes)}
                 
                 # Build adjacency information
                 self.adjacency = {node_id: [] for node_id in self.node_ids}
                 for branch_id, (from_node, to_node) in self.branch_to_nodes.items():
-                    self.adjacency[from_node].append(to_node)
-                    self.adjacency[to_node].append(from_node)
+                    if from_node in self.node_ids and to_node in self.node_ids:
+                        self.adjacency[from_node].append(to_node)
+                        self.adjacency[to_node].append(from_node)  # Undirected graph
                 
                 print(f"Initialized dataset with {len(self.node_ids)} nodes and {len(self.branch_ids)} branches")
             else:
                 raise FileNotFoundError(f"Could not find data files for time step {t}")
 
+
     def _load_time_step_data(self, time_step):
         """Load data for a specific time step"""
-        i_path = os.path.join(self.data_dir, f'Imeas_data_{time_step}.csv')
-        v_path = os.path.join(self.data_dir, f'Vmeas_data_{time_step}.csv')
+        line_path = os.path.join(self.data_dir, f'{time_step}_line_currents.csv')
+        node_path = os.path.join(self.data_dir, f'{time_step}_node_voltages.csv')
         
-        if not os.path.exists(i_path) or not os.path.exists(v_path):
+        if not os.path.exists(line_path) or not os.path.exists(node_path):
             raise FileNotFoundError(f"Missing data for time step {time_step}")
         
-        i_df = pd.read_csv(i_path)
-        v_df = pd.read_csv(v_path)
+        line_df = pd.read_csv(line_path)
+        node_df = pd.read_csv(node_path)
         
         # Process voltage data
         node_features = {}
-        for _, row in v_df.iterrows():
-            node_id = row['Node_ID']
+        for _, row in node_df.iterrows():
+            node_id = row['Node']
             if node_id not in self.node_ids:
                 continue
-                
-            # Extract complex components for each phase
-            v_real_a, v_imag_a = self._parse_complex(row['V_A'])
+            
+            # Extract phase A voltage (complex components)
+            va_mag = row['Va_mag']
+            va_ang = row['Va_ang_deg']
+            v_real, v_imag = self._parse_complex_from_mag_ang(va_mag, va_ang)
             
             # Use magnitude and phase as additional features
-            magnitude = np.sqrt(v_real_a**2 + v_imag_a**2)
-            phase_deg = np.degrees(np.arctan2(v_imag_a, v_real_a))
+            magnitude = va_mag  # Already have magnitude
+            phase_deg = va_ang  # Already have phase in degrees
             
-            # Store features
-            node_features[node_id] = [v_real_a, v_imag_a, magnitude, phase_deg]
+            # Store features: [v_real, v_imag, magnitude, phase_deg]
+            node_features[node_id] = [v_real, v_imag, magnitude, phase_deg]
         
         # Process current data
         edge_features = {}
-        for _, row in i_df.iterrows():
-            branch_id = row['Branch_ID']
+        for _, row in line_df.iterrows():
+            branch_id = row['Line']
             if branch_id not in self.branch_ids:
                 continue
-                
+            
             from_node, to_node = self.branch_to_nodes[branch_id]
             
-            # Parse complex current
-            i_real_a, i_imag_a = self._parse_complex(row['I_A'])
+            # Parse phase A current (complex components)
+            ia_mag = row['Ia_mag']
+            ia_ang = row['Ia_ang_deg']
+            i_real, i_imag = self._parse_complex_from_mag_ang(ia_mag, ia_ang)
             
             # Get voltage values for the endpoints
             if from_node in node_features and to_node in node_features:
@@ -160,8 +193,8 @@ class TemporalPowerGridDataset(Dataset):
                 vdiff_imag = from_v_imag - to_v_imag
                 
                 # Calculate complex power S = V * I*
-                s_real = from_v_real * i_real_a + from_v_imag * i_imag_a
-                s_imag = from_v_imag * i_real_a - from_v_real * i_imag_a
+                s_real = from_v_real * i_real + from_v_imag * i_imag
+                s_imag = from_v_imag * i_real - from_v_real * i_imag
                 
                 # Store edge features [Vdiff_Real, Vdiff_Imag, S_Real, S_Imag]
                 edge_features[branch_id] = [vdiff_real, vdiff_imag, s_real, s_imag]
@@ -173,7 +206,7 @@ class TemporalPowerGridDataset(Dataset):
         Prepare PyTorch Geometric data object for a specific time step with a single virtual child node
         
         Args:
-            time_step: Time step index
+            time_step: Time step string (HHMM format)
             node_features: Dictionary mapping node ID to features
             edge_features: Dictionary mapping branch ID to features
             hidden_nodes: Set of node IDs to hide (if None, will be computed)
@@ -233,9 +266,14 @@ class TemporalPowerGridDataset(Dataset):
         
         father_nodes = torch.tensor(known_indices, dtype=torch.long)
         
-        # Create time index for each node
-        time_index = torch.full((num_nodes,), time_step, dtype=torch.long)
+        # Convert time step from HHMM format to minutes since midnight for numerical representation
+        time_minutes = int(time_step[:2]) * 60 + int(time_step[2:])
         
+        # Create time index for each node
+        time_index = torch.full((num_nodes,), time_minutes, dtype=torch.long)
+        
+        # The rest of the method remains largely the same as before
+        # Handling the training vs. testing data generation
         if self.is_train:
             # Features for known nodes
             father_feats = x[father_nodes]
@@ -244,7 +282,7 @@ class TemporalPowerGridDataset(Dataset):
             # Generate labels for candidate nodes
             real_labels = []
             for i, idx in enumerate(known_indices):
-                node_id = list(sorted(self.node_ids))[idx]
+                node_id = sorted(list(self.node_ids), key=lambda x: str(x))[idx]
                 # Check if this node has any hidden neighbors
                 has_hidden_neighbor = any(neighbor in hidden_nodes for neighbor in self.adjacency[node_id])
                 real_labels.append(1 if has_hidden_neighbor else 0)
@@ -252,7 +290,6 @@ class TemporalPowerGridDataset(Dataset):
             
             # Create features for real child
             child_feats_real = father_feats.clone()
-            fake_labels = torch.zeros(Nf, dtype=torch.long)
             
             # Combine features for all nodes
             node_features_combined = torch.cat([father_feats, child_feats_real], dim=0)
@@ -264,7 +301,7 @@ class TemporalPowerGridDataset(Dataset):
             candidate_nodes_label = real_labels
             
             # Create time index for all nodes (including candidates)
-            time_index_combined = torch.full((total_num_nodes,), time_step, dtype=torch.long)
+            time_index_combined = torch.full((total_num_nodes,), time_minutes, dtype=torch.long)
             
             # Create father-child edges
             fc_edges_real = []
@@ -277,7 +314,7 @@ class TemporalPowerGridDataset(Dataset):
                 
                 if real_labels[i] == 1:
                     # This father has a hidden neighbor
-                    father_node_id = list(sorted(self.node_ids))[known_indices[i]]
+                    father_node_id = sorted(list(self.node_ids), key=lambda x: str(x))[known_indices[i]]
                     
                     # Find a hidden neighbor
                     hidden_neighbor = None
@@ -288,8 +325,8 @@ class TemporalPowerGridDataset(Dataset):
                     
                     if hidden_neighbor is not None:
                         # Find the branch connecting these nodes
-                        branch_key = f"{father_node_id}_{hidden_neighbor}"
-                        alt_branch_key = f"{hidden_neighbor}_{father_node_id}"
+                        branch_key = f"{father_node_id}->{hidden_neighbor}"
+                        alt_branch_key = f"{hidden_neighbor}->{father_node_id}"
                         
                         if branch_key in edge_features:
                             fc_attr_real.append(edge_features[branch_key])
@@ -351,7 +388,7 @@ class TemporalPowerGridDataset(Dataset):
                 fc_edges=fc_edges_real,
                 fc_attr=fc_attr_real,
                 time_index=time_index_combined,
-                time_step=torch.tensor([time_step], dtype=torch.long)
+                time_step=torch.tensor([time_minutes], dtype=torch.long)
             )
             
             return data, hidden_nodes
@@ -367,7 +404,7 @@ class TemporalPowerGridDataset(Dataset):
             # Generate labels
             label_list = []
             for i, idx in enumerate(known_indices):
-                node_id = list(sorted(self.node_ids))[idx]
+                node_id = sorted(list(self.node_ids), key=lambda x: str(x))[idx]
                 # Check if this node has any hidden neighbors
                 has_hidden_neighbor = any(neighbor in hidden_nodes for neighbor in self.adjacency[node_id])
                 label_list.append(1 if has_hidden_neighbor else 0)
@@ -382,7 +419,7 @@ class TemporalPowerGridDataset(Dataset):
             candidate_nodes_label = label_list
             
             # Create time index for all nodes
-            time_index_combined = torch.full((total_num_nodes,), time_step, dtype=torch.long)
+            time_index_combined = torch.full((total_num_nodes,), time_minutes, dtype=torch.long)
             
             # Create father-child edges
             fc_edges = []
@@ -393,15 +430,15 @@ class TemporalPowerGridDataset(Dataset):
                 
                 if label_list[i] == 1:
                     # This father has a hidden neighbor
-                    father_node_id = list(sorted(self.node_ids))[known_indices[i]]
+                    father_node_id = sorted(list(self.node_ids), key=lambda x: str(x))[known_indices[i]]
                     
                     # Find a hidden neighbor
                     found_edge = False
                     for neighbor in self.adjacency[father_node_id]:
                         if neighbor in hidden_nodes:
                             # Find the branch connecting these nodes
-                            branch_key = f"{father_node_id}_{neighbor}"
-                            alt_branch_key = f"{neighbor}_{father_node_id}"
+                            branch_key = f"{father_node_id}->{neighbor}"
+                            alt_branch_key = f"{neighbor}->{father_node_id}"
                             
                             if branch_key in edge_features:
                                 fc_attr.append(edge_features[branch_key])
@@ -468,7 +505,7 @@ class TemporalPowerGridDataset(Dataset):
                 fc_edges=fc_edges,
                 fc_attr=fc_attr,
                 time_index=time_index_combined,
-                time_step=torch.tensor([time_step], dtype=torch.long)
+                time_step=torch.tensor([time_minutes], dtype=torch.long)
             )
             
             return data, hidden_nodes
