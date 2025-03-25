@@ -177,20 +177,68 @@ class TemporalGraphormerLayer(nn.Module):
         x = x + self.dropout(h)
         return x
 
+# Update to the TemporalEmbedding class in model.py
+
 class TemporalEmbedding(nn.Module):
-    """Generate embeddings for different time steps"""
-    def __init__(self, max_time_steps, hidden_dim):
+    """
+    Generate embeddings for different time steps
+    Can handle both minute level (0-1439) and hourly level (0-23) time steps
+    """
+    def __init__(self, max_time_steps=1440, hidden_dim=64):
         super().__init__()
+        self.max_time_steps = max_time_steps
         self.time_embedding = nn.Embedding(max_time_steps, hidden_dim)
+        
+        # For hourly mode (max_time_steps=24), we don't need minute embeddings
+        if max_time_steps <= 24:
+            # Simplified embedding for hourly data
+            self.is_hourly = True
+            self.hour_embedding = nn.Embedding(24, hidden_dim)
+            self.combine_proj = nn.Linear(hidden_dim * 2, hidden_dim)
+        else:
+            # Detailed embeddings for minute-level data
+            self.is_hourly = False
+            self.hour_embedding = nn.Embedding(24, hidden_dim // 2)
+            self.minute_embedding = nn.Embedding(60, hidden_dim // 2)
+            self.combine_proj = nn.Linear(hidden_dim * 2, hidden_dim)
         
     def forward(self, time_indices):
         """
         Args:
-            time_indices: Time indices [batch_size]
+            time_indices: Time indices - either minutes since midnight [0-1439] 
+                          or hours [0-23] depending on initialization
         Returns:
             Temporal embeddings [batch_size, hidden_dim]
         """
-        return self.time_embedding(time_indices)
+        # Ensure time indices are within bounds
+        time_indices = torch.clamp(time_indices, 0, self.max_time_steps - 1)
+        
+        # Basic time embedding
+        time_emb = self.time_embedding(time_indices)
+        
+        if self.is_hourly:
+            # For hourly data, time_indices are directly hours [0-23]
+            hour_emb = self.hour_embedding(time_indices)
+            # Combine embeddings
+            combined_emb = torch.cat([time_emb, hour_emb], dim=-1)
+        else:
+            # For minute data, extract hour and minute components
+            hours = torch.div(time_indices, 60, rounding_mode='floor')
+            minutes = time_indices % 60
+            
+            # Generate hour and minute embeddings
+            hour_emb = self.hour_embedding(hours)
+            minute_emb = self.minute_embedding(minutes)
+            
+            # Combine hour and minute embeddings
+            combined_emb = torch.cat([hour_emb, minute_emb], dim=-1)
+            # Combine with the basic time embedding
+            combined_emb = torch.cat([time_emb, combined_emb], dim=-1)
+        
+        # Project to final embedding size
+        final_emb = self.combine_proj(combined_emb)
+        
+        return final_emb
 
 class TemporalGraphormer(nn.Module):
     def __init__(self, input_dim, hidden_dim=64, num_heads=4, num_layers=3, 
