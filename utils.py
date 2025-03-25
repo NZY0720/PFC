@@ -137,6 +137,8 @@ def train_step(model, data_sequence, optimizer, lambda_edge=1.0, lambda_phy=10.0
         'temporal_loss': total_temporal_loss if sequence_length > 1 else 0.0
     }
 
+# Updates for utils.py to support non-numeric node IDs
+
 def visualize_results(data, node_probs, node_feats_pred, iteration=0, threshold=0.5, save_path='./results'):
     """
     Visualize the power grid graph with predicted nodes.
@@ -162,9 +164,10 @@ def visualize_results(data, node_probs, node_feats_pred, iteration=0, threshold=
     # Identify predicted existing nodes (nodes with probability >= threshold)
     pred_exist_nodes = [candidate_nodes[i] for i, p in enumerate(node_probs) if p >= threshold]
     
-    # Add nodes to graph
-    G.add_nodes_from(known_nodes, type='known')
-    G.add_nodes_from(candidate_nodes, type='candidate')
+    # Add nodes to graph - use string node IDs for better visualizations
+    # Use index as node label since actual node IDs might be complex strings
+    G.add_nodes_from([(i, {'type': 'known'}) for i in known_nodes])
+    G.add_nodes_from([(i, {'type': 'candidate'}) for i in candidate_nodes])
     
     # Add edges if available
     if data.edge_index is not None:
@@ -204,10 +207,13 @@ def visualize_results(data, node_probs, node_feats_pred, iteration=0, threshold=
         pos_labels = {k: (v[0], v[1] + 0.08) for k, v in pos.items()}  # Offset labels
         nx.draw_networkx_labels(G, pos_labels, labels=subset_labels, font_size=8, font_color='red')
     
-    # Add time step if available
+    # Convert time step from minutes to HHMM format for display
     time_info = ""
     if hasattr(data, 'time_step'):
-        time_info = f" - Time Step {data.time_step.item()}"
+        minutes = data.time_step.item()
+        hours = minutes // 60
+        mins = minutes % 60
+        time_info = f" - Time {hours:02d}:{mins:02d}"
     
     plt.title(f'Power Grid{time_info} - Iteration {iteration}')
     plt.legend()
@@ -250,6 +256,7 @@ def visualize_results(data, node_probs, node_feats_pred, iteration=0, threshold=
         plt.savefig(hist_path, dpi=300, bbox_inches='tight')
         plt.close()
         print(f"[INFO] Probability histogram saved to {hist_path}")
+
 
 def visualize_temporal_results(data_sequence, node_probs_sequence, node_feats_sequence, iteration=0, threshold=0.5, save_path='./results'):
     """
