@@ -2,6 +2,69 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+class GraphStructureEncoder(nn.Module):
+    def __init__(self, hidden_dim):
+        super().__init__()
+        self.position_embedding = nn.Embedding(100, hidden_dim // 4)  # 最多100个位置编码
+        self.degree_embedding = nn.Embedding(50, hidden_dim // 4)     # 最大度数49
+        self.centrality_projection = nn.Linear(3, hidden_dim // 4)    # 3种中心性度量
+        self.structure_projection = nn.Linear(hidden_dim, hidden_dim)
+        
+    def forward(self, edge_index, num_nodes):
+        # 计算节点度数
+        node_degrees = torch.zeros(num_nodes, device=edge_index.device)
+        if edge_index.size(1) > 0:  # 确保有边存在
+            unique_nodes, degree_counts = torch.unique(edge_index[0], return_counts=True)
+            node_degrees[unique_nodes] = degree_counts.float()
+        node_degrees = torch.clamp(node_degrees, max=49)  # 限制最大度数
+        
+        # 计算节点位置（例如，基于谱聚类或布局算法的位置索引）
+        # 这里简化为使用度数排名作为位置的代理
+        if torch.sum(node_degrees) > 0:  # 确保有非零度数
+            degree_rank = torch.argsort(torch.argsort(node_degrees, descending=True))
+        else:
+            degree_rank = torch.zeros(num_nodes, device=edge_index.device)
+        position_indices = torch.clamp(degree_rank, max=99)  # 限制最大位置索引
+        
+        # 计算简化的中心性度量
+        # 1. 度中心性（归一化）
+        if num_nodes > 1:
+            degree_centrality = node_degrees / (num_nodes - 1)
+        else:
+            degree_centrality = node_degrees
+            
+        # 2. 简化的接近中心性（使用度数的倒数作为代理）
+        closeness_centrality = 1 / (node_degrees + 1)
+        
+        # 3. 简化的介数中心性（使用度数的平方作为代理）
+        deg_max = node_degrees.max()
+        if deg_max > 0:
+            betweenness_centrality = (node_degrees / deg_max) ** 2
+        else:
+            betweenness_centrality = torch.zeros_like(node_degrees)
+            
+        # 组合中心性度量
+        centrality_features = torch.stack([
+            degree_centrality,
+            closeness_centrality,
+            betweenness_centrality
+        ], dim=1)
+        
+        # 获取嵌入
+        position_emb = self.position_embedding(position_indices.long())
+        degree_emb = self.degree_embedding(node_degrees.long())
+        centrality_emb = self.centrality_projection(centrality_features)
+        
+        # 拼接并投影所有结构特征
+        structure_emb = torch.cat([
+            position_emb,
+            degree_emb,
+            centrality_emb,
+            torch.zeros(num_nodes, self.position_embedding.embedding_dim, device=edge_index.device)  # 填充到完整维度
+        ], dim=1)
+        
+        return self.structure_projection(structure_emb)
+
 class TemporalGraphormerMultiHeadAttention(nn.Module):
     def __init__(self, embed_dim, num_heads, dropout=0.1):
         super().__init__()
@@ -177,8 +240,6 @@ class TemporalGraphormerLayer(nn.Module):
         x = x + self.dropout(h)
         return x
 
-# Update to the TemporalEmbedding class in model.py
-
 class TemporalEmbedding(nn.Module):
     """
     Generate embeddings for different time steps
@@ -310,18 +371,19 @@ class TemporalGraphormer(nn.Module):
 
 class TemporalVirtualNodePredictor(nn.Module):
     """
-    Enhanced model for predicting virtual nodes with temporal awareness:
-      1) node_probs => node label=0/1 (existence prediction)
-      2) node_feats_pred => (V_real, V_imag) for voltage predictions
-      3) edge_feature_head => predict (VdiffR, VdiffI, S_real, S_imag) 
-         only for existing child nodes (label=1)
+    带有时间感知的虚拟节点预测模型：
+      1) node_probs => 节点标签=0/1（存在性预测）
+      2) node_feats_pred => (V_real, V_imag) 电压预测
+      3) edge_feature_head => 预测 (VdiffR, VdiffI, S_real, S_imag) 
+         仅对存在的子节点（标签=1）
     """
     def __init__(self, node_in_dim, edge_in_dim, hidden_dim=64, num_layers=3, 
-                 num_heads=4, max_time_steps=24, dropout=0.1):
+                 num_heads=4, max_time_steps=24, dropout=0.1, exist_bias=0.0):
         super().__init__()
         self.hidden_dim = hidden_dim
+        self.exist_bias = exist_bias  # 新增存在性预测的偏置，正值增加预测正样本的倾向
         
-        # Use TemporalGraphormer as encoder
+        # 使用TemporalGraphormer作为编码器
         self.encoder = TemporalGraphormer(
             input_dim=node_in_dim,
             hidden_dim=hidden_dim,
@@ -331,47 +393,53 @@ class TemporalVirtualNodePredictor(nn.Module):
             max_time_steps=max_time_steps
         )
         
-        # Node existence prediction head
+        # 添加图结构编码器
+        self.structure_encoder = GraphStructureEncoder(hidden_dim)
+        
+        # 节点存在性预测头
         self.node_exist_head = nn.Linear(hidden_dim, 1)
         
-        # Node feature prediction head (voltage real and imaginary parts)
+        # 节点特征预测头（电压实部和虚部）
         self.node_feature_head = nn.Linear(hidden_dim, 2)
         
-        # Edge feature prediction head
+        # 边特征预测头
         self.edge_feature_head = nn.Sequential(
             nn.Linear(2*hidden_dim, hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, 4)
         )
         
-        # Optional: Temporal trend head to capture changes over time
+        # 可选: 时间趋势头，捕捉随时间的变化
         self.predict_temporal_trend = False
         if self.predict_temporal_trend:
-            self.temporal_trend_head = nn.Linear(hidden_dim, 2)  # Predict change in V_real, V_imag
+            self.temporal_trend_head = nn.Linear(hidden_dim, 2)  # 预测V_real, V_imag的变化
 
     def forward(self, x, edge_index, edge_attr, candidate_nodes, time_index=None, batch=None):
         """
-        Forward pass through the model
+        模型前向传播
         
         Args:
-            x: Node features [N, node_in_dim]
-            edge_index: Edge indices [2, E]
-            edge_attr: Edge features [E, 4]
-            candidate_nodes: Indices of candidate nodes
-            time_index: Time step index for each node [N] (optional)
-            batch: Batch index for each node [N] (optional)
+            x: 节点特征 [N, node_in_dim]
+            edge_index: 边索引 [2, E]
+            edge_attr: 边特征 [E, 4]
+            candidate_nodes: 候选节点的索引
+            time_index: 每个节点的时间步索引 [N]（可选）
+            batch: 每个节点的批次索引 [N]（可选）
             
         Returns:
-            node_probs: Node existence probabilities [num_candidate_nodes]
-            node_feats_pred: Predicted node features [N, 2] (V_real, V_imag)
-            node_emb: Node embeddings [N, hidden_dim]
+            node_probs: 节点存在概率 [num_candidate_nodes]
+            node_feats_pred: 预测的节点特征 [N, 2] (V_real, V_imag)
+            node_emb: 节点嵌入 [N, hidden_dim]
         """
-        # Safety check for candidate_nodes to make sure they're in valid range
+        # 安全检查，确保candidate_nodes在有效范围内
         num_nodes = x.size(0)
         if candidate_nodes.max() >= num_nodes:
             candidate_nodes = torch.clamp(candidate_nodes, 0, num_nodes - 1)
+        
+        # 获取图结构嵌入
+        structure_emb = self.structure_encoder(edge_index, num_nodes)
             
-        # Encode nodes using the TemporalGraphormer
+        # 使用TemporalGraphormer编码节点
         node_emb = self.encoder(
             x, 
             edge_index=edge_index, 
@@ -379,19 +447,27 @@ class TemporalVirtualNodePredictor(nn.Module):
             time_index=time_index,
             batch=batch
         )  # [N, hidden_dim]
+        
+        # 结合结构嵌入
+        node_emb = node_emb + structure_emb
 
-        # Node existence prediction
+        # 节点存在性预测
         node_scores = self.node_exist_head(node_emb).squeeze(-1)  # [N]
+        
+        # 添加存在性偏置，正值增加预测1的倾向
+        if self.exist_bias != 0:
+            node_scores = node_scores + self.exist_bias
+            
         node_probs = torch.sigmoid(node_scores[candidate_nodes])  # [num_candidate_nodes]
 
-        # Node feature prediction (voltages)
+        # 节点特征预测（电压）
         node_feats_pred = self.node_feature_head(node_emb)  # [N, 2]
         
-        # Temporal trend prediction (optional)
+        # 时间趋势预测（可选）
         if self.predict_temporal_trend and time_index is not None:
             temporal_trends = self.temporal_trend_head(node_emb)  # [N, 2]
-            # The trends could be used to adjust predictions based on time
-            # This implementation is left as a placeholder
+            # 趋势可用于基于时间调整预测
+            # 此处仅为占位实现
             pass
 
         return node_probs, node_feats_pred, node_emb
