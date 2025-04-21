@@ -7,25 +7,59 @@ import os
 
 from constraints import power_flow_constraint 
 
-def train_step(model, data_sequence, optimizer, lambda_edge=1.0, lambda_phy=10.0, lambda_temporal=1.0):
+def weighted_binary_cross_entropy(predictions, targets, pos_weight=None):
     """
-    Training step for temporal model
+    计算带权重的二元交叉熵损失，处理正负样本不平衡问题
     
     Args:
-        model: The TemporalVirtualNodePredictor model
-        data_sequence: List of PyG Data objects representing a temporal sequence
-        optimizer: PyTorch optimizer
-        lambda_edge: Weight for edge feature loss
-        lambda_phy: Weight for physics constraint loss
-        lambda_temporal: Weight for temporal consistency loss
+        predictions: 模型预测的概率 [batch_size]
+        targets: 真实标签 [batch_size]
+        pos_weight: 正样本权重，如果为None则自动计算
         
     Returns:
-        Dictionary of loss values
+        加权后的BCE损失
+    """
+    if pos_weight is None:
+        # 自动计算正样本权重：负样本数量/正样本数量
+        num_positives = targets.sum()
+        if num_positives > 0:
+            num_negatives = len(targets) - num_positives
+            pos_weight = num_negatives / num_positives
+        else:
+            pos_weight = 1.0
+    
+    # 计算带正样本权重的BCE损失
+    loss = F.binary_cross_entropy_with_logits(
+        torch.log(predictions / (1 - predictions + 1e-7)),  # 将概率转换为logits
+        targets,
+        pos_weight=torch.tensor([pos_weight], device=predictions.device)
+    )
+    
+    return loss
+
+def train_step(model, data_sequence, optimizer, lambda_edge=1.0, lambda_phy=10.0, lambda_temporal=1.0, 
+              pos_weight=None, focal_gamma=2.0, use_focal_loss=False):
+    """
+    训练步骤，支持加权BCE损失或Focal Loss处理不平衡问题
+    
+    Args:
+        model: TemporalVirtualNodePredictor模型
+        data_sequence: PyG Data对象列表，表示时间序列
+        optimizer: PyTorch优化器
+        lambda_edge: 边特征损失权重
+        lambda_phy: 物理约束损失权重
+        lambda_temporal: 时间一致性损失权重
+        pos_weight: 正样本权重，如果为None则自动计算
+        focal_gamma: Focal Loss的gamma参数
+        use_focal_loss: 是否使用Focal Loss代替加权BCE
+        
+    Returns:
+        损失值字典
     """
     model.train()
     optimizer.zero_grad()
     
-    # Handle single data point case
+    # 处理单个数据点的情况
     if not isinstance(data_sequence, list):
         data_sequence = [data_sequence]
     
@@ -36,13 +70,13 @@ def train_step(model, data_sequence, optimizer, lambda_edge=1.0, lambda_phy=10.0
     total_temporal_loss = 0.0
     sequence_length = len(data_sequence)
     
-    # Store predictions for temporal consistency loss
+    # 存储预测结果用于计算时间一致性损失
     all_node_probs = []
     all_node_feats = []
     
-    # Process each time step in the sequence
+    # 处理序列中的每个时间步
     for t, data in enumerate(data_sequence):
-        # Forward pass
+        # 前向传播
         if torch.isnan(data.x).any() or torch.isinf(data.x).any():
             print(f"Warning: NaN or Inf found in input features at time step {t}")
         if torch.isnan(data.edge_attr).any() or torch.isinf(data.edge_attr).any():
@@ -56,19 +90,41 @@ def train_step(model, data_sequence, optimizer, lambda_edge=1.0, lambda_phy=10.0
             time_index=data.time_index
         )
         
-        # Store predictions for temporal consistency
+        # 存储结果用于时间一致性计算
         all_node_probs.append(node_probs)
         all_node_feats.append(node_feats_pred)
         
-        # 1) Node existence loss (binary cross entropy)
-        node_loss = F.binary_cross_entropy(node_probs, data.candidate_nodes_label.float())
+        # 1) 节点存在性损失(带权重的二元交叉熵)
+        # 计算当前批次的正负样本分布
+        if use_focal_loss:
+            # Focal Loss: 下调高置信度预测的权重，强调难例
+            p_t = node_probs * data.candidate_nodes_label.float() + (1 - node_probs) * (1 - data.candidate_nodes_label.float())
+            focal_weight = (1 - p_t) ** focal_gamma
+            
+            # 应用可选的正样本权重
+            if pos_weight is not None:
+                # 对正样本额外加权
+                weight = torch.ones_like(data.candidate_nodes_label.float())
+                weight[data.candidate_nodes_label == 1] = pos_weight
+                focal_weight = focal_weight * weight
+            
+            # 计算带权重的损失
+            node_loss = F.binary_cross_entropy(node_probs, data.candidate_nodes_label.float(), reduction='none')
+            node_loss = (focal_weight * node_loss).mean()
+        else:
+            # 使用加权BCE损失
+            node_loss = weighted_binary_cross_entropy(
+                node_probs, 
+                data.candidate_nodes_label.float(),
+                pos_weight
+            )
         
-        # 2) Edge feature regression loss
+        # 2) 边特征回归损失
         edge_feat_loss = torch.tensor(0.0, device=data.x.device)
         if hasattr(data, 'fc_edges') and hasattr(data, 'fc_attr'):
             fc_edges = data.fc_edges  # [2, fc_count]
             fc_attr = data.fc_attr    # [fc_count, 4]
-            mask = (data.candidate_nodes_label == 1)  # Only regress edges for real child nodes
+            mask = (data.candidate_nodes_label == 1)  # 只对真实子节点回归边
             
             if mask.any():
                 father_idx = fc_edges[0, mask]
@@ -82,7 +138,7 @@ def train_step(model, data_sequence, optimizer, lambda_edge=1.0, lambda_phy=10.0
                 
                 edge_feat_loss = F.mse_loss(pred_edge_feat, fc_attr_sel)
         
-        # 3) Physics constraint loss
+        # 3) 物理约束损失
         phy_loss = power_flow_constraint(
             node_feats_pred,
             data.edge_index,
@@ -91,25 +147,25 @@ def train_step(model, data_sequence, optimizer, lambda_edge=1.0, lambda_phy=10.0
             data.candidate_nodes_label
         )
         
-        # Accumulate individual loss terms
+        # 累加各损失项
         step_loss = node_loss + lambda_edge * edge_feat_loss + lambda_phy * phy_loss
         total_loss += step_loss
         
-        # Track individual loss components
+        # 跟踪各损失组件
         total_node_loss += node_loss.item()
         total_edge_loss += edge_feat_loss.item()
         total_phy_loss += phy_loss.item()
     
-    # 4) Temporal consistency loss (if sequence length > 1)
+    # 4) 时间一致性损失（如果序列长度>1）
     temporal_loss = torch.tensor(0.0, device=data.x.device)
     if sequence_length > 1:
-        # Apply temporal consistency - node existence probabilities should change smoothly
+        # 应用时间一致性 - 节点存在概率应平滑变化
         for t in range(sequence_length - 1):
             if len(all_node_probs[t]) == len(all_node_probs[t+1]):
-                # L2 loss for probability differences
+                # 概率差的L2损失
                 temporal_loss += F.mse_loss(all_node_probs[t], all_node_probs[t+1])
                 
-                # L2 loss for voltage prediction differences (should change smoothly)
+                # 电压预测差的L2损失（应平滑变化）
                 candidate_indices = data_sequence[t].candidate_nodes
                 temporal_loss += 0.1 * F.mse_loss(
                     all_node_feats[t][candidate_indices], 
@@ -120,11 +176,11 @@ def train_step(model, data_sequence, optimizer, lambda_edge=1.0, lambda_phy=10.0
         total_loss += lambda_temporal * temporal_loss
         total_temporal_loss = temporal_loss.item()
     
-    # Backward pass and optimization
+    # 反向传播和优化
     total_loss.backward()
     optimizer.step()
     
-    # Calculate average losses
+    # 计算平均损失
     avg_node_loss = total_node_loss / sequence_length
     avg_edge_loss = total_edge_loss / sequence_length
     avg_phy_loss = total_phy_loss / sequence_length
