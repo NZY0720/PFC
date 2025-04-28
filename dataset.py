@@ -97,27 +97,35 @@ class TemporalPowerGridDataset(Dataset):
                 line_df = pd.read_csv(line_path)
                 node_df = pd.read_csv(node_path)
                 
-                # Collect all node IDs - handle non-numeric IDs
+                # Print data types for debugging
+                print("\n===== DATA TYPE CHECK =====")
+                print(f"Node column type in node_df: {node_df['Node'].dtype}")
+                print(f"Sample node from node_df: {node_df['Node'].iloc[0]} (type: {type(node_df['Node'].iloc[0])})")
+                print(f"Line column type in line_df: {line_df['Line'].dtype}")
+                print(f"Sample line from line_df: {line_df['Line'].iloc[0]} (type: {type(line_df['Line'].iloc[0])})")
+                
+                # Collect all node IDs - ALWAYS CONVERT TO STRINGS
                 for node_id in node_df['Node']:
-                    self.node_ids.add(node_id)
+                    self.node_ids.add(str(node_id))  # Convert to string
                 
                 # Collect all branch IDs and extract node pairs
                 self.branch_to_nodes = {}
+                
                 for _, row in line_df.iterrows():
                     branch_id = row['Line']
                     # Parse branch_id to get from_node and to_node
-                    # New format can include non-numeric IDs like "114->R1"
                     match = re.match(r'(.+)->(.+)', branch_id)
                     if match:
-                        from_node = match.group(1)
-                        to_node = match.group(2)
+                        from_node = str(match.group(1))  # Convert to string
+                        to_node = str(match.group(2))    # Convert to string
                         self.branch_ids.add(branch_id)
                         self.branch_to_nodes[branch_id] = (from_node, to_node)
                     elif '->' in branch_id:
                         # Fallback if regex doesn't match but arrow is present
                         parts = branch_id.split('->')
                         if len(parts) == 2:
-                            from_node, to_node = parts
+                            from_node = str(parts[0])  # Convert to string 
+                            to_node = str(parts[1])    # Convert to string
                             self.branch_ids.add(branch_id)
                             self.branch_to_nodes[branch_id] = (from_node, to_node)
                 
@@ -127,15 +135,79 @@ class TemporalPowerGridDataset(Dataset):
                 
                 # Build adjacency information
                 self.adjacency = {node_id: [] for node_id in self.node_ids}
+                edges_added = 0
+                
                 for branch_id, (from_node, to_node) in self.branch_to_nodes.items():
                     if from_node in self.node_ids and to_node in self.node_ids:
                         self.adjacency[from_node].append(to_node)
                         self.adjacency[to_node].append(from_node)  # Undirected graph
+                        edges_added += 1
+                    else:
+                        # Only print first few warnings to avoid excessive output
+                        if len(self.adjacency.get(from_node, [])) < 2 and len(self.adjacency.get(to_node, [])) < 2:
+                            if from_node not in self.node_ids:
+                                print(f"Warning: from_node '{from_node}' not in node_ids")
+                            if to_node not in self.node_ids:
+                                print(f"Warning: to_node '{to_node}' not in node_ids")
                 
+                # Print connectivity stats after modifications
+                isolated_nodes = sum(1 for neighbors in self.adjacency.values() if len(neighbors) == 0)
+                connected_nodes = sum(1 for neighbors in self.adjacency.values() if len(neighbors) > 0)
+                print(f"\nAfter type conversion: Connected nodes: {connected_nodes}, Isolated nodes: {isolated_nodes}")
+                print(f"Total edges added: {edges_added}")
                 print(f"Initialized dataset with {len(self.node_ids)} nodes and {len(self.branch_ids)} branches")
-            else:
-                raise FileNotFoundError(f"Could not find data files for time step {t}")
 
+    def _debug_node_connectivity(self, hidden_nodes):
+        """Debug function to analyze connectivity of hidden nodes"""
+        print("\n===== DEBUGGING NODE CONNECTIVITY =====")
+        
+        # Count hidden nodes and their connections
+        hidden_count = len(hidden_nodes)
+        hidden_with_neighbors = 0
+        
+        # Count father nodes that have hidden neighbors
+        fathers_with_hidden_neighbors = 0
+        known_nodes = set(self.node_ids) - hidden_nodes
+        
+        hidden_neighbor_counts = []
+        
+        # Check each hidden node's connectivity
+        for node_id in hidden_nodes:
+            neighbors = self.adjacency[node_id]
+            known_neighbors = [n for n in neighbors if n in known_nodes]
+            
+            if known_neighbors:
+                hidden_with_neighbors += 1
+                hidden_neighbor_counts.append(len(known_neighbors))
+        
+        # Check each known node's connectivity to hidden nodes
+        for node_id in known_nodes:
+            neighbors = self.adjacency[node_id]
+            has_hidden_neighbor = any(n in hidden_nodes for n in neighbors)
+            if has_hidden_neighbor:
+                fathers_with_hidden_neighbors += 1
+        
+        # Print statistics
+        print(f"Total nodes: {len(self.node_ids)}")
+        print(f"Hidden nodes: {hidden_count} ({hidden_count/len(self.node_ids):.4f})")
+        
+        # Fix the format specifier error
+        if hidden_count > 0:
+            hidden_ratio = hidden_with_neighbors / hidden_count
+        else:
+            hidden_ratio = 0
+        print(f"Hidden nodes with known neighbors: {hidden_with_neighbors} ({hidden_ratio:.4f})")
+        
+        if len(known_nodes) > 0:
+            father_ratio = fathers_with_hidden_neighbors / len(known_nodes)
+        else:
+            father_ratio = 0
+        print(f"Father nodes with hidden neighbors: {fathers_with_hidden_neighbors} ({father_ratio:.4f})")
+        
+        if hidden_neighbor_counts:
+            print(f"Avg. known neighbors per hidden node: {sum(hidden_neighbor_counts)/len(hidden_neighbor_counts):.2f}")
+        
+        print("=======================================\n")
 
     def _load_time_step_data(self, time_step):
         """Load data for a specific time step"""
@@ -151,7 +223,7 @@ class TemporalPowerGridDataset(Dataset):
         # Process voltage data
         node_features = {}
         for _, row in node_df.iterrows():
-            node_id = row['Node']
+            node_id = str(row['Node'])  # Convert to string
             if node_id not in self.node_ids:
                 continue
             
@@ -175,6 +247,7 @@ class TemporalPowerGridDataset(Dataset):
                 continue
             
             from_node, to_node = self.branch_to_nodes[branch_id]
+            # Strings already by this point, no need to convert
             
             # Parse phase A current (complex components)
             ia_mag = row['Ia_mag']
@@ -226,10 +299,10 @@ class TemporalPowerGridDataset(Dataset):
         # Prepare edges
         edge_list = []
         edge_attr_list = []
-        
+
         for branch_id, (from_node, to_node) in self.branch_to_nodes.items():
             if branch_id in edge_features:
-                # Convert node IDs to indices
+                # Both from_node and to_node are already strings
                 if from_node in self.node_id_to_idx and to_node in self.node_id_to_idx:
                     from_idx = self.node_id_to_idx[from_node]
                     to_idx = self.node_id_to_idx[to_node]
@@ -245,17 +318,31 @@ class TemporalPowerGridDataset(Dataset):
         edge_index = torch.tensor(edge_list, dtype=torch.long).t() if edge_list else torch.zeros((2, 0), dtype=torch.long)
         edge_attr = torch.tensor(edge_attr_list, dtype=torch.float) if edge_attr_list else torch.zeros((0, 4), dtype=torch.float)
         
+        # Debug edge information
+        print(f"Original edge_index shape: {edge_index.shape}")
+        
         # Determine nodes to hide if not provided
         if hidden_nodes is None:
             # Calculate node degrees
             degrees = {node_id: len(neighbors) for node_id, neighbors in self.adjacency.items()}
             
-            # Sort nodes by degree
-            sorted_nodes = sorted(degrees.keys(), key=lambda n: degrees[n])
+            # Filter out isolated nodes (degree 0)
+            non_isolated_nodes = [node_id for node_id, degree in degrees.items() if degree > 0]
             
-            # Hide the specified ratio of lowest-degree nodes
+            if not non_isolated_nodes:
+                print("WARNING: All nodes are isolated! Cannot create meaningful hiding strategy.")
+                # Fall back to original strategy
+                sorted_nodes = sorted(degrees.keys(), key=lambda n: degrees[n])
+            else:
+                # Sort non-isolated nodes by degree
+                sorted_nodes = sorted(non_isolated_nodes, key=lambda n: degrees[n])
+            
+            # Hide the specified ratio of lowest-degree CONNECTED nodes
             num_to_hide = int(len(sorted_nodes) * self.hide_ratio)
             hidden_nodes = set(sorted_nodes[:num_to_hide])
+            
+            # Debug the connectivity of hidden nodes
+            self._debug_node_connectivity(hidden_nodes)
         
         # Create masks for known and hidden nodes
         known_nodes = set(self.node_ids) - hidden_nodes
@@ -288,6 +375,11 @@ class TemporalPowerGridDataset(Dataset):
                 real_labels.append(1 if has_hidden_neighbor else 0)
             real_labels = torch.tensor(real_labels, dtype=torch.long)
             
+            # Print positive example stats
+            pos_count = sum(real_labels).item()
+            pos_ratio = pos_count / len(real_labels) if len(real_labels) > 0 else 0
+            print(f"Positive examples: {pos_count}/{len(real_labels)} ({pos_ratio:.4f})")
+            
             # Create features for real child
             child_feats_real = father_feats.clone()
             
@@ -306,7 +398,7 @@ class TemporalPowerGridDataset(Dataset):
             # Create father-child edges
             fc_edges_real = []
             fc_attr_real = []
-            
+
             for i in range(Nf):
                 father_new_idx = i
                 child_new_idx = Nf + i
@@ -315,6 +407,7 @@ class TemporalPowerGridDataset(Dataset):
                 if real_labels[i] == 1:
                     # This father has a hidden neighbor
                     father_node_id = sorted(list(self.node_ids), key=lambda x: str(x))[known_indices[i]]
+                    # father_node_id is already a string
                     
                     # Find a hidden neighbor
                     hidden_neighbor = None
@@ -348,18 +441,38 @@ class TemporalPowerGridDataset(Dataset):
             # Create a mapping from old to new indices for father nodes
             old2new = {old_idx: new_idx for new_idx, old_idx in enumerate(known_indices)}
             
-            for i, (s, t) in enumerate(zip(edge_index[0], edge_index[1])):
-                s_item, t_item = s.item(), t.item()
-                if s_item in old2new and t_item in old2new:
-                    father_edges.append((old2new[s_item], old2new[t_item]))
-                    father_attrs.append(edge_attr[i].tolist())
+            # Debug the mapping
+            print(f"Number of known indices: {len(known_indices)}")
+            print(f"old2new mapping size: {len(old2new)}")
+            
+            if edge_index.size(1) > 0:
+                max_source = edge_index[0].max().item()
+                max_target = edge_index[1].max().item()
+                print(f"Max source idx: {max_source}, Max target idx: {max_target}")
+                
+                # Find edges between father nodes
+                father_father_edges = 0
+                for i, (s, t) in enumerate(zip(edge_index[0], edge_index[1])):
+                    s_item, t_item = s.item(), t.item()
+                    if s_item in old2new and t_item in old2new:
+                        father_edges.append((old2new[s_item], old2new[t_item]))
+                        father_attrs.append(edge_attr[i].tolist())
+                        father_father_edges += 1
+                
+                print(f"Father-father edges found: {father_father_edges}")
             
             father_edges = torch.tensor(father_edges, dtype=torch.long).T if father_edges else torch.zeros((2, 0), dtype=torch.long)
             father_attrs = torch.tensor(father_attrs, dtype=torch.float) if father_attrs else torch.zeros((0, 4), dtype=torch.float)
             
+            print(f"Father edges shape: {father_edges.shape}")
+            print(f"FC edges shape: {fc_edges_real.shape}")
+            
             # Combine all edges
             new_edge_index = torch.cat([father_edges, fc_edges_real], dim=1) if father_edges.size(1) > 0 else fc_edges_real
             new_edge_attr = torch.cat([father_attrs, fc_attr_real], dim=0) if father_attrs.size(0) > 0 else fc_attr_real
+            
+            # Debug final edge information
+            print(f"Combined edge_index shape: {new_edge_index.shape}")
             
             # Create mask for known nodes
             node_known_mask = torch.zeros(total_num_nodes, dtype=torch.bool)
@@ -370,8 +483,8 @@ class TemporalPowerGridDataset(Dataset):
             V_imag = node_features_combined[:, 1]
             
             # Extract power components from edge attributes
-            known_S_real = new_edge_attr[:, 2]
-            known_S_imag = new_edge_attr[:, 3]
+            known_S_real = new_edge_attr[:, 2] if new_edge_attr.size(0) > 0 else torch.tensor([])
+            known_S_imag = new_edge_attr[:, 3] if new_edge_attr.size(0) > 0 else torch.tensor([])
             
             # Create PyG data object
             data = Data(
@@ -409,6 +522,11 @@ class TemporalPowerGridDataset(Dataset):
                 has_hidden_neighbor = any(neighbor in hidden_nodes for neighbor in self.adjacency[node_id])
                 label_list.append(1 if has_hidden_neighbor else 0)
             label_list = torch.tensor(label_list, dtype=torch.long)
+            
+            # Print positive example stats
+            pos_count = sum(label_list).item()
+            pos_ratio = pos_count / len(label_list) if len(label_list) > 0 else 0
+            print(f"Positive examples (test): {pos_count}/{len(label_list)} ({pos_ratio:.4f})")
             
             # Combine features
             node_features_combined = torch.cat([father_feats, child_feats], dim=0)
@@ -465,18 +583,27 @@ class TemporalPowerGridDataset(Dataset):
             # Create a mapping from old to new indices for father nodes
             old2new = {old_idx: new_idx for new_idx, old_idx in enumerate(known_indices)}
             
-            for i, (s, t) in enumerate(zip(edge_index[0], edge_index[1])):
-                s_item, t_item = s.item(), t.item()
-                if s_item in old2new and t_item in old2new:
-                    father_edges.append((old2new[s_item], old2new[t_item]))
-                    father_attrs.append(edge_attr[i].tolist())
+            if edge_index.size(1) > 0:
+                # Find edges between father nodes
+                for i, (s, t) in enumerate(zip(edge_index[0], edge_index[1])):
+                    s_item, t_item = s.item(), t.item()
+                    if s_item in old2new and t_item in old2new:
+                        father_edges.append((old2new[s_item], old2new[t_item]))
+                        father_attrs.append(edge_attr[i].tolist())
             
             father_edges = torch.tensor(father_edges, dtype=torch.long).T if father_edges else torch.zeros((2, 0), dtype=torch.long)
             father_attrs = torch.tensor(father_attrs, dtype=torch.float) if father_attrs else torch.zeros((0, 4), dtype=torch.float)
             
+            # Debug edge information for test data
+            print(f"Test father edges shape: {father_edges.shape}")
+            print(f"Test FC edges shape: {fc_edges.shape}")
+            
             # Combine all edges
             new_edge_index = torch.cat([father_edges, fc_edges], dim=1) if father_edges.size(1) > 0 else fc_edges
             new_edge_attr = torch.cat([father_attrs, fc_attr], dim=0) if father_attrs.size(0) > 0 else fc_attr
+            
+            # Debug final edge information
+            print(f"Test combined edge_index shape: {new_edge_index.shape}")
             
             # Create mask for known nodes
             node_known_mask = torch.zeros(total_num_nodes, dtype=torch.bool)
@@ -487,9 +614,10 @@ class TemporalPowerGridDataset(Dataset):
             V_imag = node_features_combined[:, 1]
             
             # Extract power components from edge attributes
-            known_S_real = new_edge_attr[:, 2]
-            known_S_imag = new_edge_attr[:, 3]
+            known_S_real = new_edge_attr[:, 2] if new_edge_attr.size(0) > 0 else torch.tensor([])
+            known_S_imag = new_edge_attr[:, 3] if new_edge_attr.size(0) > 0 else torch.tensor([])
             
+            # Create PyG data object
             # Create PyG data object
             data = Data(
                 x=node_features_combined,
