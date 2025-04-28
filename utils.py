@@ -198,14 +198,6 @@ def train_step(model, data_sequence, optimizer, lambda_edge=1.0, lambda_phy=10.0
 def visualize_results(data, node_probs, node_feats_pred, iteration=0, threshold=0.5, save_path='./results'):
     """
     Visualize the power grid graph with predicted nodes.
-    
-    Args:
-        data: The PyTorch Geometric data object
-        node_probs: Predicted node existence probabilities
-        node_feats_pred: Predicted node features (V_real, V_imag)
-        iteration: Iteration number or identifier for the filename
-        threshold: Probability threshold for considering a node to exist
-        save_path: Directory to save visualization
     """
     G = nx.Graph()
     
@@ -217,25 +209,41 @@ def visualize_results(data, node_probs, node_feats_pred, iteration=0, threshold=
     # Get candidate nodes
     candidate_nodes = data.candidate_nodes.tolist()
     
-    # Identify predicted existing nodes (nodes with probability >= threshold)
+    # Identify predicted existing nodes
     pred_exist_nodes = [candidate_nodes[i] for i, p in enumerate(node_probs) if p >= threshold]
     
-    # Add nodes to graph - use string node IDs for better visualizations
-    # Use index as node label since actual node IDs might be complex strings
+    # Add nodes to graph
     G.add_nodes_from([(i, {'type': 'known'}) for i in known_nodes])
     G.add_nodes_from([(i, {'type': 'candidate'}) for i in candidate_nodes])
     
-    # Add edges if available
+    # Add edges if available and debug edge information
+    edge_count = 0
     if data.edge_index is not None:
+        print(f"Edge index shape: {data.edge_index.shape}")
+        print(f"Number of edges: {data.edge_index.shape[1]}")
+        
+        # Debug first few edges
+        if data.edge_index.shape[1] > 0:
+            print("First 10 edges:")
+            for i in range(min(10, data.edge_index.shape[1])):
+                src = data.edge_index[0, i].item()
+                dst = data.edge_index[1, i].item()
+                print(f"  Edge {i}: {src} -> {dst}")
+        
         edge_list = data.edge_index.t().tolist()
         G.add_edges_from(edge_list, type='known')
+        edge_count = len(edge_list)
+    
+    print(f"Added {edge_count} edges to visualization graph")
+    print(f"NetworkX graph has {G.number_of_nodes()} nodes and {G.number_of_edges()} edges")
     
     # Create layout and plot
     pos = nx.spring_layout(G, seed=42)  # Fixed seed for consistent layouts
     plt.figure(figsize=(12, 10))
     
-    # Draw edges
-    nx.draw_networkx_edges(G, pos, edge_color='gray', alpha=0.5)
+    # Draw edges with increased width and alpha
+    nx.draw_networkx_edges(G, pos, edge_color='gray', alpha=0.7, width=1.5)
+    
     
     # Draw different node types
     nx.draw_networkx_nodes(G, pos, nodelist=known_nodes, node_color='lightblue', 
