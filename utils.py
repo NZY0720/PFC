@@ -193,8 +193,6 @@ def train_step(model, data_sequence, optimizer, lambda_edge=1.0, lambda_phy=10.0
         'temporal_loss': total_temporal_loss if sequence_length > 1 else 0.0
     }
 
-# Updates for utils.py to support non-numeric node IDs
-
 def visualize_results(data, node_probs, node_feats_pred, iteration=0, threshold=0.5, save_path='./results'):
     """
     Visualize the power grid graph with predicted nodes.
@@ -238,20 +236,34 @@ def visualize_results(data, node_probs, node_feats_pred, iteration=0, threshold=
     print(f"NetworkX graph has {G.number_of_nodes()} nodes and {G.number_of_edges()} edges")
     
     # Create layout and plot
-    pos = nx.spring_layout(G, seed=42)  # Fixed seed for consistent layouts
+    pos = nx.spring_layout(G, seed=42, k=0.5)  # Increased k for better spacing
     plt.figure(figsize=(12, 10))
     
-    # Draw edges with increased width and alpha
-    nx.draw_networkx_edges(G, pos, edge_color='gray', alpha=0.7, width=1.5)
+    # Analyze edge types and create separate lists for different visualizations
+    father_father_edges = []
+    father_child_edges = []
+    for u, v in G.edges():
+        if u < len(known_nodes) and v < len(known_nodes):
+            father_father_edges.append((u, v))
+        else:
+            father_child_edges.append((u, v))
     
+    # Draw different edge types with increased visibility
+    if father_father_edges:
+        nx.draw_networkx_edges(G, pos, edgelist=father_father_edges, 
+                              edge_color='black', alpha=0.9, width=2.0)
+    
+    if father_child_edges:
+        nx.draw_networkx_edges(G, pos, edgelist=father_child_edges, 
+                              edge_color='blue', alpha=0.7, width=1.5, style='dashed')
     
     # Draw different node types
     nx.draw_networkx_nodes(G, pos, nodelist=known_nodes, node_color='lightblue', 
-                          label='Known Nodes', node_size=80)
+                          label='Known Nodes', node_size=100)  # Increased node size
     
     # Mark candidate nodes based on predictions
     nx.draw_networkx_nodes(G, pos, nodelist=pred_exist_nodes, node_color='green', 
-                          label='Predicted Exist', node_size=60)
+                          label='Predicted Exist', node_size=80)
     
     # Draw labels for the nodes
     nx.draw_networkx_labels(G, pos, font_size=8)
@@ -291,6 +303,62 @@ def visualize_results(data, node_probs, node_feats_pred, iteration=0, threshold=
     
     print(f"[INFO] Visualization saved to {outpath}")
     
+    # If very few edges are detected, try to reconstruct a more meaningful structure for a second visualization
+    if G.number_of_edges() < G.number_of_nodes() / 4:  # If too few edges
+        print("[WARN] Few edges detected, creating additional structural visualization")
+        plt.figure(figsize=(12, 10))
+        
+        # Create a new graph with a structural layout
+        G_structural = nx.Graph()
+        G_structural.add_nodes_from(G.nodes(data=True))
+        
+        # Create a tree structure connecting known nodes
+        known_nodes_sorted = sorted(known_nodes)
+        for i in range(1, len(known_nodes_sorted)):
+            G_structural.add_edge(known_nodes_sorted[0], known_nodes_sorted[i], type='structural')
+        
+        # Connect predicted nodes to nearest known node
+        for pred_node in pred_exist_nodes:
+            closest_node = min(known_nodes, key=lambda x: abs(x - pred_node))
+            G_structural.add_edge(pred_node, closest_node, type='predicted')
+        
+        # Add original edges also
+        G_structural.add_edges_from(G.edges(), type='original')
+        
+        # Create new layout
+        pos_structural = nx.spring_layout(G_structural, seed=42, k=0.3)
+        
+        # Draw different edge types
+        original_edges = [(u, v) for u, v, d in G_structural.edges(data=True) if d.get('type') == 'original']
+        structural_edges = [(u, v) for u, v, d in G_structural.edges(data=True) if d.get('type') == 'structural']
+        predicted_edges = [(u, v) for u, v, d in G_structural.edges(data=True) if d.get('type') == 'predicted']
+        
+        nx.draw_networkx_edges(G_structural, pos_structural, edgelist=original_edges, 
+                              edge_color='black', width=2.0, alpha=0.9)
+        nx.draw_networkx_edges(G_structural, pos_structural, edgelist=structural_edges, 
+                              edge_color='gray', width=1.5, style='dashed', alpha=0.7)
+        nx.draw_networkx_edges(G_structural, pos_structural, edgelist=predicted_edges, 
+                              edge_color='green', width=1.5, alpha=0.7)
+        
+        # Draw nodes
+        nx.draw_networkx_nodes(G_structural, pos_structural, nodelist=known_nodes, 
+                              node_color='lightblue', label='Known Nodes', node_size=100)
+        nx.draw_networkx_nodes(G_structural, pos_structural, nodelist=pred_exist_nodes, 
+                              node_color='green', label='Predicted Exist', node_size=80)
+        
+        # Draw labels
+        nx.draw_networkx_labels(G_structural, pos_structural, font_size=8)
+        
+        plt.title(f'Power Grid (Structural View){time_info} - Iteration {iteration}')
+        plt.legend()
+        plt.axis('off')
+        
+        # Save the structural visualization
+        structural_outpath = os.path.join(save_path, f'structural_{iteration}.png')
+        plt.savefig(structural_outpath, dpi=300, bbox_inches='tight')
+        plt.close()
+        print(f"[INFO] Structural visualization saved to {structural_outpath}")
+    
     # Additional metrics visualization
     if node_probs is not None and hasattr(data, 'candidate_nodes_label'):
         # Get true labels
@@ -320,7 +388,6 @@ def visualize_results(data, node_probs, node_feats_pred, iteration=0, threshold=
         plt.savefig(hist_path, dpi=300, bbox_inches='tight')
         plt.close()
         print(f"[INFO] Probability histogram saved to {hist_path}")
-
 
 def visualize_temporal_results(data_sequence, node_probs_sequence, node_feats_sequence, iteration=0, threshold=0.5, save_path='./results'):
     """
