@@ -8,19 +8,9 @@ import os
 from constraints import power_flow_constraint 
 
 def weighted_binary_cross_entropy(predictions, targets, pos_weight=None):
-    """
-    计算带权重的二元交叉熵损失，处理正负样本不平衡问题
-    
-    Args:
-        predictions: 模型预测的概率 [batch_size]
-        targets: 真实标签 [batch_size]
-        pos_weight: 正样本权重，如果为None则自动计算
-        
-    Returns:
-        加权后的BCE损失
-    """
+    """Calculate weighted binary cross entropy loss for handling class imbalance"""
     if pos_weight is None:
-        # 自动计算正样本权重：负样本数量/正样本数量
+        # Calculate weight automatically if not provided
         num_positives = targets.sum()
         if num_positives > 0:
             num_negatives = len(targets) - num_positives
@@ -28,9 +18,9 @@ def weighted_binary_cross_entropy(predictions, targets, pos_weight=None):
         else:
             pos_weight = 1.0
     
-    # 计算带正样本权重的BCE损失
+    # Convert probabilities to logits for weighted BCE loss
     loss = F.binary_cross_entropy_with_logits(
-        torch.log(predictions / (1 - predictions + 1e-7)),  # 将概率转换为logits
+        torch.log(predictions / (1 - predictions + 1e-7)),
         targets,
         pos_weight=torch.tensor([pos_weight], device=predictions.device)
     )
@@ -39,27 +29,11 @@ def weighted_binary_cross_entropy(predictions, targets, pos_weight=None):
 
 def train_step(model, data_sequence, optimizer, lambda_edge=1.0, lambda_phy=10.0, lambda_temporal=1.0, 
               pos_weight=None, focal_gamma=2.0, use_focal_loss=False):
-    """
-    训练步骤，支持加权BCE损失或Focal Loss处理不平衡问题
-    
-    Args:
-        model: TemporalVirtualNodePredictor模型
-        data_sequence: PyG Data对象列表，表示时间序列
-        optimizer: PyTorch优化器
-        lambda_edge: 边特征损失权重
-        lambda_phy: 物理约束损失权重
-        lambda_temporal: 时间一致性损失权重
-        pos_weight: 正样本权重，如果为None则自动计算
-        focal_gamma: Focal Loss的gamma参数
-        use_focal_loss: 是否使用Focal Loss代替加权BCE
-        
-    Returns:
-        损失值字典
-    """
+    """Training step with support for weighted loss functions"""
     model.train()
     optimizer.zero_grad()
     
-    # 处理单个数据点的情况
+    # Handle single data point
     if not isinstance(data_sequence, list):
         data_sequence = [data_sequence]
     
@@ -70,18 +44,13 @@ def train_step(model, data_sequence, optimizer, lambda_edge=1.0, lambda_phy=10.0
     total_temporal_loss = 0.0
     sequence_length = len(data_sequence)
     
-    # 存储预测结果用于计算时间一致性损失
+    # Store predictions for temporal loss calculation
     all_node_probs = []
     all_node_feats = []
     
-    # 处理序列中的每个时间步
+    # Process each time step in the sequence
     for t, data in enumerate(data_sequence):
-        # 前向传播
-        if torch.isnan(data.x).any() or torch.isinf(data.x).any():
-            print(f"Warning: NaN or Inf found in input features at time step {t}")
-        if torch.isnan(data.edge_attr).any() or torch.isinf(data.edge_attr).any():
-            print(f"Warning: NaN or Inf found in edge attributes at time step {t}")
-        
+        # Forward pass
         node_probs, node_feats_pred, node_emb = model(
             data.x,
             data.edge_index,
@@ -90,55 +59,50 @@ def train_step(model, data_sequence, optimizer, lambda_edge=1.0, lambda_phy=10.0
             time_index=data.time_index
         )
         
-        # 存储结果用于时间一致性计算
         all_node_probs.append(node_probs)
         all_node_feats.append(node_feats_pred)
         
-        # 1) 节点存在性损失(带权重的二元交叉熵)
-        # 计算当前批次的正负样本分布
+        # 1) Node existence loss
         if use_focal_loss:
-            # Focal Loss: 下调高置信度预测的权重，强调难例
+            # Focal Loss calculation
             p_t = node_probs * data.candidate_nodes_label.float() + (1 - node_probs) * (1 - data.candidate_nodes_label.float())
             focal_weight = (1 - p_t) ** focal_gamma
             
-            # 应用可选的正样本权重
             if pos_weight is not None:
-                # 对正样本额外加权
                 weight = torch.ones_like(data.candidate_nodes_label.float())
                 weight[data.candidate_nodes_label == 1] = pos_weight
                 focal_weight = focal_weight * weight
             
-            # 计算带权重的损失
             node_loss = F.binary_cross_entropy(node_probs, data.candidate_nodes_label.float(), reduction='none')
             node_loss = (focal_weight * node_loss).mean()
         else:
-            # 使用加权BCE损失
+            # Weighted BCE loss
             node_loss = weighted_binary_cross_entropy(
                 node_probs, 
                 data.candidate_nodes_label.float(),
                 pos_weight
             )
         
-        # 2) 边特征回归损失
+        # 2) Edge feature loss - only for true child nodes
         edge_feat_loss = torch.tensor(0.0, device=data.x.device)
         if hasattr(data, 'fc_edges') and hasattr(data, 'fc_attr'):
-            fc_edges = data.fc_edges  # [2, fc_count]
-            fc_attr = data.fc_attr    # [fc_count, 4]
-            mask = (data.candidate_nodes_label == 1)  # 只对真实子节点回归边
+            fc_edges = data.fc_edges
+            fc_attr = data.fc_attr
+            mask = (data.candidate_nodes_label == 1)
             
             if mask.any():
                 father_idx = fc_edges[0, mask]
                 child_idx = fc_edges[1, mask]
                 fc_attr_sel = fc_attr[mask]
                 
-                father_emb = node_emb[father_idx]    # [sum(mask), hidden_dim]
-                child_emb = node_emb[child_idx]      # [sum(mask), hidden_dim]
-                edge_in = torch.cat([father_emb, child_emb], dim=1)  # => [sum(mask), 2*hidden_dim]
-                pred_edge_feat = model.edge_feature_head(edge_in)    # => [sum(mask), 4]
+                father_emb = node_emb[father_idx]
+                child_emb = node_emb[child_idx]
+                edge_in = torch.cat([father_emb, child_emb], dim=1)
+                pred_edge_feat = model.edge_feature_head(edge_in)
                 
                 edge_feat_loss = F.mse_loss(pred_edge_feat, fc_attr_sel)
         
-        # 3) 物理约束损失
+        # 3) Physics constraint loss
         phy_loss = power_flow_constraint(
             node_feats_pred,
             data.edge_index,
@@ -147,25 +111,25 @@ def train_step(model, data_sequence, optimizer, lambda_edge=1.0, lambda_phy=10.0
             data.candidate_nodes_label
         )
         
-        # 累加各损失项
+        # Combine losses for this time step
         step_loss = node_loss + lambda_edge * edge_feat_loss + lambda_phy * phy_loss
         total_loss += step_loss
         
-        # 跟踪各损失组件
+        # Track loss components
         total_node_loss += node_loss.item()
         total_edge_loss += edge_feat_loss.item()
         total_phy_loss += phy_loss.item()
     
-    # 4) 时间一致性损失（如果序列长度>1）
+    # 4) Temporal consistency loss for sequences
     temporal_loss = torch.tensor(0.0, device=data.x.device)
     if sequence_length > 1:
-        # 应用时间一致性 - 节点存在概率应平滑变化
+        # Calculate temporal consistency for node probabilities and voltages
         for t in range(sequence_length - 1):
             if len(all_node_probs[t]) == len(all_node_probs[t+1]):
-                # 概率差的L2损失
+                # Probability smoothness
                 temporal_loss += F.mse_loss(all_node_probs[t], all_node_probs[t+1])
                 
-                # 电压预测差的L2损失（应平滑变化）
+                # Voltage smoothness
                 candidate_indices = data_sequence[t].candidate_nodes
                 temporal_loss += 0.1 * F.mse_loss(
                     all_node_feats[t][candidate_indices], 
@@ -175,12 +139,14 @@ def train_step(model, data_sequence, optimizer, lambda_edge=1.0, lambda_phy=10.0
         temporal_loss = temporal_loss / (sequence_length - 1)
         total_loss += lambda_temporal * temporal_loss
         total_temporal_loss = temporal_loss.item()
+    else:
+        total_temporal_loss = 0.0
     
-    # 反向传播和优化
+    # Backward pass and optimization
     total_loss.backward()
     optimizer.step()
     
-    # 计算平均损失
+    # Calculate average losses
     avg_node_loss = total_node_loss / sequence_length
     avg_edge_loss = total_edge_loss / sequence_length
     avg_phy_loss = total_phy_loss / sequence_length
@@ -194,96 +160,95 @@ def train_step(model, data_sequence, optimizer, lambda_edge=1.0, lambda_phy=10.0
     }
 
 def visualize_results(data, node_probs, node_feats_pred, iteration=0, threshold=0.5, save_path='./results'):
-    """
-    Visualize the power grid graph with predicted nodes.
-    """
+    """Visualize the power grid with predictions"""
+    # Create the graph
     G = nx.Graph()
     
-    # Identify known nodes based on mask
-    known_nodes = []
-    if hasattr(data, 'node_known_mask'):
-        known_nodes = data.node_known_mask.nonzero().view(-1).tolist()
+    # Number of original visible (father) nodes
+    num_father_nodes = data.node_known_mask.sum().item()
+    num_virtual_nodes = len(data.candidate_nodes)
     
-    # Get candidate nodes
-    candidate_nodes = data.candidate_nodes.tolist()
-    
-    # Identify predicted existing nodes
-    pred_exist_nodes = [candidate_nodes[i] for i, p in enumerate(node_probs) if p >= threshold]
+    # Create node indices
+    father_indices = range(num_father_nodes)  # Original visible nodes
+    virtual_indices = range(num_father_nodes, num_father_nodes + num_virtual_nodes)  # Virtual nodes
     
     # Add nodes to graph
-    G.add_nodes_from([(i, {'type': 'known'}) for i in known_nodes])
-    G.add_nodes_from([(i, {'type': 'candidate'}) for i in candidate_nodes])
+    G.add_nodes_from([(i, {'type': 'father'}) for i in father_indices])
+    G.add_nodes_from([(i, {'type': 'virtual'}) for i in virtual_indices])
     
-    # Add edges if available and debug edge information
-    edge_count = 0
-    if data.edge_index is not None:
-        print(f"Edge index shape: {data.edge_index.shape}")
-        print(f"Number of edges: {data.edge_index.shape[1]}")
-        
-        # Debug first few edges
-        if data.edge_index.shape[1] > 0:
-            print("First 10 edges:")
-            for i in range(min(10, data.edge_index.shape[1])):
-                src = data.edge_index[0, i].item()
-                dst = data.edge_index[1, i].item()
-                print(f"  Edge {i}: {src} -> {dst}")
-        
-        edge_list = data.edge_index.t().tolist()
-        G.add_edges_from(edge_list, type='known')
-        edge_count = len(edge_list)
+    # Get predicted existing virtual nodes
+    virtual_pred_exist = [
+        virtual_indices[i] for i, p in enumerate(node_probs) if p >= threshold
+    ]
     
-    print(f"Added {edge_count} edges to visualization graph")
-    print(f"NetworkX graph has {G.number_of_nodes()} nodes and {G.number_of_edges()} edges")
+    # Add edges between father nodes (original grid structure)
+    father_father_edges = []
+    if data.edge_index is not None and data.edge_index.size(1) > 0:
+        for i in range(data.edge_index.size(1)):
+            src = data.edge_index[0, i].item()
+            dst = data.edge_index[1, i].item()
+            
+            # Only include edges between father nodes
+            if src < num_father_nodes and dst < num_father_nodes:
+                if (src, dst) not in father_father_edges and (dst, src) not in father_father_edges:
+                    father_father_edges.append((src, dst))
     
-    # Create layout and plot
-    pos = nx.spring_layout(G, seed=42, k=0.5)  # Increased k for better spacing
+    G.add_edges_from(father_father_edges, type='father-father')
+    
+    # Add edges between father and virtual nodes
+    father_virtual_edges = []
+    for i in range(num_virtual_nodes):
+        father_idx = i  # Each father maps to its corresponding virtual node
+        virtual_idx = num_father_nodes + i
+        father_virtual_edges.append((father_idx, virtual_idx))
+    
+    G.add_edges_from(father_virtual_edges, type='father-virtual')
+    
+    print(f"Graph has {G.number_of_nodes()} nodes and {G.number_of_edges()} edges")
+    print(f"Father-father edges: {len(father_father_edges)}")
+    print(f"Father-virtual edges: {len(father_virtual_edges)}")
+    print(f"Predicted existing virtual nodes: {len(virtual_pred_exist)}")
+    
+    # Create a spring layout
+    pos = nx.spring_layout(G, seed=42, k=0.3)
+    
+    # Visualization
     plt.figure(figsize=(12, 10))
     
-    # Analyze edge types and create separate lists for different visualizations
-    father_father_edges = []
-    father_child_edges = []
-    for u, v in G.edges():
-        if u < len(known_nodes) and v < len(known_nodes):
-            father_father_edges.append((u, v))
-        else:
-            father_child_edges.append((u, v))
+    # Draw the different edge types
+    nx.draw_networkx_edges(G, pos, edgelist=father_father_edges, 
+                          edge_color='black', alpha=0.6, width=1.0)
     
-    # Draw different edge types with increased visibility
-    if father_father_edges:
-        nx.draw_networkx_edges(G, pos, edgelist=father_father_edges, 
-                              edge_color='black', alpha=0.9, width=2.0)
+    # Highlight edges to predicted existing virtual nodes
+    pred_edges = [(i, num_father_nodes + i) for i in range(num_father_nodes) 
+                 if num_father_nodes + i in virtual_pred_exist]
     
-    if father_child_edges:
-        nx.draw_networkx_edges(G, pos, edgelist=father_child_edges, 
-                              edge_color='blue', alpha=0.7, width=1.5, style='dashed')
+    nx.draw_networkx_edges(G, pos, edgelist=pred_edges, 
+                          edge_color='green', alpha=0.8, width=2.0)
     
-    # Draw different node types
-    nx.draw_networkx_nodes(G, pos, nodelist=known_nodes, node_color='lightblue', 
-                          label='Known Nodes', node_size=100)  # Increased node size
+    # Other father-virtual edges as dashed
+    other_edges = [(i, j) for i, j in father_virtual_edges if (i, j) not in pred_edges]
+    nx.draw_networkx_edges(G, pos, edgelist=other_edges, 
+                          edge_color='gray', alpha=0.3, width=0.5, style='dashed')
     
-    # Mark candidate nodes based on predictions
-    nx.draw_networkx_nodes(G, pos, nodelist=pred_exist_nodes, node_color='green', 
-                          label='Predicted Exist', node_size=80)
+    # Draw nodes
+    nx.draw_networkx_nodes(G, pos, nodelist=father_indices, 
+                          node_color='lightblue', label='Visible Nodes', node_size=100)
     
-    # Draw labels for the nodes
-    nx.draw_networkx_labels(G, pos, font_size=8)
+    # Predicted existing virtual nodes
+    nx.draw_networkx_nodes(G, pos, nodelist=virtual_pred_exist, 
+                          node_color='green', label='Predicted Existing Nodes', node_size=80)
     
-    # Add voltage values as node attributes if node_feats_pred is provided
-    if node_feats_pred is not None:
-        node_labels = {}
-        for i, node in enumerate(G.nodes()):
-            if i < len(node_feats_pred):
-                v_real = node_feats_pred[i, 0].item()
-                v_imag = node_feats_pred[i, 1].item()
-                node_labels[node] = f"{v_real:.2f}+{v_imag:.2f}i"
-        
-        # Only show labels for a subset to avoid clutter
-        subset_nodes = known_nodes[:10] + pred_exist_nodes[:5]
-        subset_labels = {node: node_labels[node] for node in subset_nodes if node in node_labels}
-        pos_labels = {k: (v[0], v[1] + 0.08) for k, v in pos.items()}  # Offset labels
-        nx.draw_networkx_labels(G, pos_labels, labels=subset_labels, font_size=8, font_color='red')
+    # Other virtual nodes
+    other_virtual = [n for n in virtual_indices if n not in virtual_pred_exist]
+    nx.draw_networkx_nodes(G, pos, nodelist=other_virtual, 
+                          node_color='lightgray', alpha=0.3, node_size=50)
     
-    # Convert time step from minutes to HHMM format for display
+    # Add node labels for father nodes
+    labels = {i: str(i) for i in father_indices}
+    nx.draw_networkx_labels(G, pos, labels=labels, font_size=8)
+    
+    # Add time info if available
     time_info = ""
     if hasattr(data, 'time_step'):
         minutes = data.time_step.item()
@@ -295,7 +260,7 @@ def visualize_results(data, node_probs, node_feats_pred, iteration=0, threshold=
     plt.legend()
     plt.axis('off')
     
-    # Save the visualization
+    # Save visualization
     os.makedirs(save_path, exist_ok=True)
     outpath = os.path.join(save_path, f'iteration_{iteration}.png')
     plt.savefig(outpath, dpi=300, bbox_inches='tight')
@@ -303,74 +268,17 @@ def visualize_results(data, node_probs, node_feats_pred, iteration=0, threshold=
     
     print(f"[INFO] Visualization saved to {outpath}")
     
-    # If very few edges are detected, try to reconstruct a more meaningful structure for a second visualization
-    if G.number_of_edges() < G.number_of_nodes() / 4:  # If too few edges
-        print("[WARN] Few edges detected, creating additional structural visualization")
-        plt.figure(figsize=(12, 10))
-        
-        # Create a new graph with a structural layout
-        G_structural = nx.Graph()
-        G_structural.add_nodes_from(G.nodes(data=True))
-        
-        # Create a tree structure connecting known nodes
-        known_nodes_sorted = sorted(known_nodes)
-        for i in range(1, len(known_nodes_sorted)):
-            G_structural.add_edge(known_nodes_sorted[0], known_nodes_sorted[i], type='structural')
-        
-        # Connect predicted nodes to nearest known node
-        for pred_node in pred_exist_nodes:
-            closest_node = min(known_nodes, key=lambda x: abs(x - pred_node))
-            G_structural.add_edge(pred_node, closest_node, type='predicted')
-        
-        # Add original edges also
-        G_structural.add_edges_from(G.edges(), type='original')
-        
-        # Create new layout
-        pos_structural = nx.spring_layout(G_structural, seed=42, k=0.3)
-        
-        # Draw different edge types
-        original_edges = [(u, v) for u, v, d in G_structural.edges(data=True) if d.get('type') == 'original']
-        structural_edges = [(u, v) for u, v, d in G_structural.edges(data=True) if d.get('type') == 'structural']
-        predicted_edges = [(u, v) for u, v, d in G_structural.edges(data=True) if d.get('type') == 'predicted']
-        
-        nx.draw_networkx_edges(G_structural, pos_structural, edgelist=original_edges, 
-                              edge_color='black', width=2.0, alpha=0.9)
-        nx.draw_networkx_edges(G_structural, pos_structural, edgelist=structural_edges, 
-                              edge_color='gray', width=1.5, style='dashed', alpha=0.7)
-        nx.draw_networkx_edges(G_structural, pos_structural, edgelist=predicted_edges, 
-                              edge_color='green', width=1.5, alpha=0.7)
-        
-        # Draw nodes
-        nx.draw_networkx_nodes(G_structural, pos_structural, nodelist=known_nodes, 
-                              node_color='lightblue', label='Known Nodes', node_size=100)
-        nx.draw_networkx_nodes(G_structural, pos_structural, nodelist=pred_exist_nodes, 
-                              node_color='green', label='Predicted Exist', node_size=80)
-        
-        # Draw labels
-        nx.draw_networkx_labels(G_structural, pos_structural, font_size=8)
-        
-        plt.title(f'Power Grid (Structural View){time_info} - Iteration {iteration}')
-        plt.legend()
-        plt.axis('off')
-        
-        # Save the structural visualization
-        structural_outpath = os.path.join(save_path, f'structural_{iteration}.png')
-        plt.savefig(structural_outpath, dpi=300, bbox_inches='tight')
-        plt.close()
-        print(f"[INFO] Structural visualization saved to {structural_outpath}")
-    
-    # Additional metrics visualization
+    # Create probability histogram
     if node_probs is not None and hasattr(data, 'candidate_nodes_label'):
-        # Get true labels
+        # Get ground truth labels
         true_labels = data.candidate_nodes_label.cpu().numpy()
-        predicted_probs = node_probs.cpu().numpy()
+        pred_probs = node_probs.cpu().numpy()
         
-        # Create histogram of probabilities
         plt.figure(figsize=(10, 6))
         
-        # Separate into positive and negative examples
-        pos_probs = predicted_probs[true_labels == 1] if len(true_labels[true_labels == 1]) > 0 else []
-        neg_probs = predicted_probs[true_labels == 0] if len(true_labels[true_labels == 0]) > 0 else []
+        # Split by positive/negative examples
+        pos_probs = pred_probs[true_labels == 1] if len(true_labels[true_labels == 1]) > 0 else []
+        neg_probs = pred_probs[true_labels == 0] if len(true_labels[true_labels == 0]) > 0 else []
         
         if len(pos_probs) > 0:
             plt.hist(pos_probs, alpha=0.7, bins=20, color='green', label='True Positive')
@@ -380,7 +288,7 @@ def visualize_results(data, node_probs, node_feats_pred, iteration=0, threshold=
         plt.axvline(x=threshold, linestyle='--', color='black', label=f'Threshold ({threshold})')
         plt.xlabel('Prediction Probability')
         plt.ylabel('Count')
-        plt.title(f'Distribution of Node Existence Probabilities{time_info}')
+        plt.title(f'Distribution of Virtual Node Existence Probabilities{time_info}')
         plt.legend()
         
         # Save histogram
@@ -390,20 +298,10 @@ def visualize_results(data, node_probs, node_feats_pred, iteration=0, threshold=
         print(f"[INFO] Probability histogram saved to {hist_path}")
 
 def visualize_temporal_results(data_sequence, node_probs_sequence, node_feats_sequence, iteration=0, threshold=0.5, save_path='./results'):
-    """
-    Visualize temporal predictions
-    
-    Args:
-        data_sequence: List of PyG Data objects representing a temporal sequence
-        node_probs_sequence: List of node probabilities for each time step
-        node_feats_sequence: List of node feature predictions for each time step
-        iteration: Iteration number or identifier for the filename
-        threshold: Probability threshold for considering a node to exist
-        save_path: Directory to save visualization
-    """
+    """Visualize results across multiple time steps"""
     sequence_length = len(data_sequence)
     
-    # Individual time step visualizations
+    # Create individual visualizations for each time step
     for t in range(sequence_length):
         visualize_results(
             data_sequence[t],
@@ -414,11 +312,12 @@ def visualize_temporal_results(data_sequence, node_probs_sequence, node_feats_se
             save_path=save_path
         )
     
-    # Temporal visualization - probability over time
+    # Create temporal plots for sequences
     if sequence_length > 1:
+        # Probability trend chart
         plt.figure(figsize=(12, 6))
         
-        # Extract candidate node probabilities for each time step
+        # Collect data for plotting
         prob_data = []
         for t, (data, probs) in enumerate(zip(data_sequence, node_probs_sequence)):
             true_labels = data.candidate_nodes_label.cpu().numpy()
@@ -430,7 +329,7 @@ def visualize_temporal_results(data_sequence, node_probs_sequence, node_feats_se
                     'label': label
                 })
         
-        # Plot probabilities over time for a subset of nodes
+        # Plot trends for a subset of nodes
         unique_nodes = np.unique([d['node'] for d in prob_data])
         selected_nodes = unique_nodes[:min(10, len(unique_nodes))]
         
@@ -444,25 +343,26 @@ def visualize_temporal_results(data_sequence, node_probs_sequence, node_feats_se
             linestyle = 'solid' if label == 1 else 'dashed'
             
             plt.plot(times, probs, marker='o', linestyle=linestyle, color=color, 
-                     label=f"Node {node} ({'Real' if label == 1 else 'Fake'})")
+                     label=f"Node {node} ({'Exists' if label == 1 else 'Does Not Exist'})")
         
         plt.axhline(y=threshold, linestyle='--', color='black', label=f'Threshold ({threshold})')
         plt.xlabel('Time Step')
         plt.ylabel('Existence Probability')
-        plt.title('Node Existence Probabilities Over Time')
+        plt.title('Virtual Node Existence Probabilities Over Time')
         plt.legend()
         plt.grid(True, alpha=0.3)
         
-        # Save the plot
+        # Save the temporal probability plot
         os.makedirs(save_path, exist_ok=True)
         temporal_path = os.path.join(save_path, f'temporal_probs_{iteration}.png')
         plt.savefig(temporal_path, dpi=300, bbox_inches='tight')
         plt.close()
         print(f"[INFO] Temporal probability plot saved to {temporal_path}")
         
-        # Voltage magnitude change over time
+        # Voltage magnitude chart
         plt.figure(figsize=(12, 6))
         
+        # Collect voltage data
         voltage_data = []
         for t, (data, node_feats) in enumerate(zip(data_sequence, node_feats_sequence)):
             for i, node_idx in enumerate(data.candidate_nodes.cpu().numpy()):
@@ -478,7 +378,7 @@ def visualize_temporal_results(data_sequence, node_probs_sequence, node_feats_se
                     'label': label
                 })
         
-        # Plot voltage magnitudes over time for a subset of nodes
+        # Plot voltage trends
         for node in selected_nodes:
             node_data = [d for d in voltage_data if d['node'] == node]
             if not node_data:
@@ -492,7 +392,7 @@ def visualize_temporal_results(data_sequence, node_probs_sequence, node_feats_se
             linestyle = 'solid' if label == 1 else 'dashed'
             
             plt.plot(times, magnitudes, marker='o', linestyle=linestyle, color=color, 
-                     label=f"Node {node} ({'Real' if label == 1 else 'Fake'})")
+                     label=f"Node {node} ({'Exists' if label == 1 else 'Does Not Exist'})")
         
         plt.xlabel('Time Step')
         plt.ylabel('Voltage Magnitude')
@@ -500,7 +400,7 @@ def visualize_temporal_results(data_sequence, node_probs_sequence, node_feats_se
         plt.legend()
         plt.grid(True, alpha=0.3)
         
-        # Save the plot
+        # Save the voltage plot
         voltage_path = os.path.join(save_path, f'voltage_magnitudes_{iteration}.png')
         plt.savefig(voltage_path, dpi=300, bbox_inches='tight')
         plt.close()
