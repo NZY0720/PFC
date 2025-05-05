@@ -105,12 +105,12 @@ class TemporalPowerGridDataset(Dataset):
         print("\nSample line data:")
         print(line_df.head(3).to_string())
         
-        # Extract nodes from voltage file (store as strings)
+        # Extract nodes from voltage file (store as integers)
         for nid in node_df['Node']:
-            self.node_ids.add(str(nid).strip())  # Ensure consistent string format
+            self.node_ids.add(int(nid))
         
         print(f"Found {len(self.node_ids)} unique nodes in voltage CSV")
-        print(f"First few nodes: {list(self.node_ids)[:5]}")
+        print(f"First few nodes: {sorted(list(self.node_ids))[:5]}")
         
         # Define 'from' and 'to' columns for branch connectivity
         from_col, to_col = None, None
@@ -123,33 +123,10 @@ class TemporalPowerGridDataset(Dataset):
             from_col, to_col = 'from_node', 'to_node'
             print("Using from_node and to_node columns (lowercase)")
         else:
-            # Create a simple line topology
-            print("Could not find explicit branch connectivity. Creating a simple line topology.")
-            
-            # Create artificial 'from' and 'to' columns as strings
-            line_df['From_Node'] = ""
-            line_df['To_Node'] = ""
-            from_col, to_col = 'From_Node', 'To_Node'
-            
-            # Convert node IDs to a list for indexing
-            str_node_ids = sorted(list(self.node_ids))
-            print(f"Creating topology with {len(str_node_ids)} nodes")
-            
-            for i, row in line_df.iterrows():
-                if i < len(str_node_ids) - 1:
-                    line_df.at[i, 'From_Node'] = str_node_ids[i]
-                    line_df.at[i, 'To_Node'] = str_node_ids[i+1]
-                else:
-                    # Connect last nodes in a cycle if needed
-                    idx1 = i % len(str_node_ids)
-                    idx2 = (i + 1) % len(str_node_ids)
-                    line_df.at[i, 'From_Node'] = str_node_ids[idx1]
-                    line_df.at[i, 'To_Node'] = str_node_ids[idx2]
+            raise ValueError("Could not find connection information in line data. Require From_Node and To_Node columns.")
         
-        # Process branch connectivity
+        # Process branch connectivity directly from the line CSV
         self.branch_to_nodes = {}
-        processed_edges = set()
-        branch_id_counter = 1
         
         # Check data types for debugging
         print("\n--- Connectivity Debug ---")
@@ -157,30 +134,32 @@ class TemporalPowerGridDataset(Dataset):
         print(f"To_Node column type: {line_df[to_col].dtype}")
         print(f"Node IDs type: {type(next(iter(self.node_ids)))}")
         
-        # Convert from/to nodes to strings to ensure consistency
-        line_df[from_col] = line_df[from_col].astype(str)
-        line_df[to_col] = line_df[to_col].astype(str)
+        # Extract branch connectivity directly from line CSV
+        print("Extracting branch connectivity from line CSV")
         
-        # Create minimal spanning tree directly - FORCED CONNECTIVITY
-        print("Creating minimal spanning tree for reliable connectivity")
-        sorted_nodes = sorted(list(self.node_ids))
-        
-        for i in range(len(sorted_nodes) - 1):
-            branch_id = i + 1
-            from_node = sorted_nodes[i]
-            to_node = sorted_nodes[i+1]
+        for i, row in line_df.iterrows():
+            branch_id = int(row['Line'])
+            from_node = int(row[from_col])
+            to_node = int(row[to_col])
             
+            # Store all branches regardless of whether nodes are in node_ids
+            # We'll filter later if needed
             self.branch_ids.add(branch_id)
             self.branch_to_nodes[branch_id] = (from_node, to_node)
+            
+            # Add to node_ids if not already present
+            self.node_ids.add(from_node)
+            self.node_ids.add(to_node)
             
             # Debug output for first few branches
             if i < 5:
                 print(f"Added branch {branch_id}: {from_node} -> {to_node}")
-                
-        print(f"Created {len(sorted_nodes) - 1} branches in minimal spanning tree")
+        
+        print(f"Extracted {len(self.branch_ids)} branches from line CSV")
+        print(f"Updated node count: {len(self.node_ids)}")
         print(f"First few branch IDs: {sorted(list(self.branch_ids))[:5]}")
         
-        # Create node index mapping
+        # Create node index mapping - ensure sorted for deterministic indexing
         sorted_nodes = sorted(list(self.node_ids))
         self.node_id_to_idx = {n: i for i, n in enumerate(sorted_nodes)}
         
@@ -195,6 +174,10 @@ class TemporalPowerGridDataset(Dataset):
         connected = len(self.node_ids) - isolated
         print(f"Final grid: {len(self.node_ids)} nodes, {len(self.branch_ids)} branches")
         print(f"Connected nodes: {connected}, Isolated nodes: {isolated}")
+        
+        # If there are isolated nodes, print a warning
+        if isolated > 0:
+            print(f"WARNING: {isolated} nodes are isolated! This may affect model performance.")
 
     def _debug_node_connectivity(self, hidden_nodes):
         """Debug function to analyze connectivity of hidden nodes"""
@@ -242,10 +225,10 @@ class TemporalPowerGridDataset(Dataset):
         # Process voltage data
         node_features = {}
         for _, row in node_df.iterrows():
-            node_id_str = str(row['Node']).strip()
+            node_id = int(row['Node'])
             
-            # Skip if node isn't in our master node list
-            if node_id_str not in self.node_ids:
+            # Skip if node isn't in our master node list (shouldn't happen since we updated it)
+            if node_id not in self.node_ids:
                 continue
             
             # Extract phase A voltage (complex components)
@@ -254,51 +237,43 @@ class TemporalPowerGridDataset(Dataset):
             v_real, v_imag = self._parse_complex_from_mag_ang(va_mag, va_ang)
             
             # Store features
-            node_features[node_id_str] = [v_real, v_imag, va_mag, va_ang]
+            node_features[node_id] = [v_real, v_imag, va_mag, va_ang]
         
-        # Process current data - FIXED VERSION for edge features
+        # Process current data for edge features - using current data directly
         edge_features = {}
         
         # Debug edge creation
         print(f"\n--- Edge Features Generation ---")
         print(f"Processing {len(self.branch_ids)} branches for time step {time_step}")
         
-        # Map branch IDs to line data by sequential position
-        for i, branch_id in enumerate(sorted(self.branch_ids)):
-            if i >= len(line_df):
-                print(f"Warning: More branches than line data rows")
-                break
-                
-            row = line_df.iloc[i]
-            
-            # Get the nodes connected by this branch
-            if branch_id in self.branch_to_nodes:
-                from_node, to_node = self.branch_to_nodes[branch_id]
-                
-                # Extract current data
-                ia_mag = row['Ia_mag']
-                ia_ang = row['Ia_ang_deg']
-                i_real, i_imag = self._parse_complex_from_mag_ang(ia_mag, ia_ang)
-                
-                # Calculate edge features if node data available
-                if from_node in node_features and to_node in node_features:
-                    from_v_real = node_features[from_node][0]
-                    from_v_imag = node_features[from_node][1]
-                    to_v_real = node_features[to_node][0]
-                    to_v_imag = node_features[to_node][1]
-                    
-                    # Calculate voltage difference
-                    vdiff_real = from_v_real - to_v_real
-                    vdiff_imag = from_v_imag - to_v_imag
-                    
-                    # Calculate complex power S = V * I*
-                    s_real = from_v_real * i_real + from_v_imag * i_imag
-                    s_imag = from_v_imag * i_real - from_v_real * i_imag
-                    
-                    # Store edge features
-                    edge_features[branch_id] = [vdiff_real, vdiff_imag, s_real, s_imag]
+        features_count = 0
         
-        print(f"Created {len(edge_features)} edge features out of {len(self.branch_ids)} branches")
+        for _, row in line_df.iterrows():
+            branch_id = int(row['Line'])
+            
+            # Skip if branch isn't in our branch mapping
+            if branch_id not in self.branch_ids:
+                continue
+            
+            # Extract current data for all three phases (A, B, C)
+            features = [
+                row['Ia_mag'], row['Ia_ang_deg'],  # Phase A
+                row['Ib_mag'], row['Ib_ang_deg'],  # Phase B
+                row['Ic_mag'], row['Ic_ang_deg']   # Phase C
+            ]
+            
+            # Store edge features - ALL edges get features even if nodes aren't in node_features
+            edge_features[branch_id] = features
+            features_count += 1
+        
+        print(f"Created {features_count} edge features out of {len(self.branch_ids)} branches")
+        
+        # If no edge features were created, provide default values
+        if features_count == 0 and len(self.branch_ids) > 0:
+            print("WARNING: No edge features could be calculated. Using default values.")
+            for branch_id in self.branch_ids:
+                # Default values for 6 features: mag and angle for 3 phases
+                edge_features[branch_id] = [0.01, 0.0, 0.01, -120.0, 0.01, 120.0]
         
         return node_features, edge_features
 
@@ -319,7 +294,7 @@ class TemporalPowerGridDataset(Dataset):
         edge_list = []
         edge_attr_list = []
         
-        # Create edges for all branches regardless of edge features
+        # Create edges for all branches that have edge features
         for branch_id, (from_node, to_node) in self.branch_to_nodes.items():
             if from_node in self.node_id_to_idx and to_node in self.node_id_to_idx:
                 from_idx = self.node_id_to_idx[from_node]
@@ -327,9 +302,38 @@ class TemporalPowerGridDataset(Dataset):
                 
                 # Use edge features if available, else default
                 if branch_id in edge_features:
-                    edge_attr = edge_features[branch_id]
+                    # For compatibility with the rest of the code, convert 6-feature current data
+                    # to 4-feature format expected by the model (VdiffR, VdiffI, S_real, S_imag)
+                    current_features = edge_features[branch_id]
+                    
+                    # Extract phase A current components
+                    i_mag = current_features[0]
+                    i_ang = current_features[1]
+                    i_real, i_imag = self._parse_complex_from_mag_ang(i_mag, i_ang)
+                    
+                    # Calculate voltage difference if both nodes have features
+                    if from_node in node_features and to_node in node_features:
+                        from_v_real = node_features[from_node][0]
+                        from_v_imag = node_features[from_node][1]
+                        to_v_real = node_features[to_node][0]
+                        to_v_imag = node_features[to_node][1]
+                        
+                        vdiff_real = from_v_real - to_v_real
+                        vdiff_imag = from_v_imag - to_v_imag
+                        
+                        # Calculate complex power S = V * I*
+                        s_real = from_v_real * i_real + from_v_imag * i_imag
+                        s_imag = from_v_imag * i_real - from_v_real * i_imag
+                    else:
+                        # Default values if voltage data not available
+                        vdiff_real = 0.01
+                        vdiff_imag = 0.01
+                        s_real = 0.1
+                        s_imag = 0.05
+                    
+                    edge_attr = [vdiff_real, vdiff_imag, s_real, s_imag]
                 else:
-                    # Default features if none available
+                    # Default edge attributes if no current data
                     edge_attr = [0.01, 0.01, 0.1, 0.05]
                 
                 # Add forward edge
@@ -364,7 +368,7 @@ class TemporalPowerGridDataset(Dataset):
                 sorted_nodes = sorted(list(degrees.keys()), key=lambda n: str(n))
             else:
                 # Sort by degree (lowest first)
-                sorted_nodes = sorted(non_isolated_nodes, key=lambda n: (degrees[n], str(n)))
+                sorted_nodes = sorted(non_isolated_nodes, key=lambda n: (degrees[n], n))
             
             # Hide the specified ratio of lowest-degree nodes
             num_to_hide = max(int(len(non_isolated_nodes) * self.hide_ratio), 1)
@@ -471,7 +475,35 @@ class TemporalPowerGridDataset(Dataset):
                             if (frm == father_node_id and to == hidden_neighbor) or \
                                (frm == hidden_neighbor and to == father_node_id):
                                 if branch_id in edge_features:
-                                    fc_attr_real.append(edge_features[branch_id])
+                                    # Convert 6-feature edge features to 4-feature format
+                                    current_features = edge_features[branch_id]
+                                    
+                                    # Extract phase A current components
+                                    i_mag = current_features[0]
+                                    i_ang = current_features[1]
+                                    i_real, i_imag = self._parse_complex_from_mag_ang(i_mag, i_ang)
+                                    
+                                    # Calculate voltage difference if both nodes have features
+                                    if father_node_id in node_features and hidden_neighbor in node_features:
+                                        from_v_real = node_features[father_node_id][0]
+                                        from_v_imag = node_features[father_node_id][1]
+                                        to_v_real = node_features[hidden_neighbor][0]
+                                        to_v_imag = node_features[hidden_neighbor][1]
+                                        
+                                        vdiff_real = from_v_real - to_v_real
+                                        vdiff_imag = from_v_imag - to_v_imag
+                                        
+                                        # Calculate complex power S = V * I*
+                                        s_real = from_v_real * i_real + from_v_imag * i_imag
+                                        s_imag = from_v_imag * i_real - from_v_real * i_imag
+                                    else:
+                                        # Default values if voltage data not available
+                                        vdiff_real = 0.01
+                                        vdiff_imag = 0.01
+                                        s_real = 0.1
+                                        s_imag = 0.05
+                                    
+                                    fc_attr_real.append([vdiff_real, vdiff_imag, s_real, s_imag])
                                     found_branch = True
                                     break
                         
@@ -591,9 +623,37 @@ class TemporalPowerGridDataset(Dataset):
                         if neighbor in hidden_nodes:
                             for branch_id, (frm, to) in self.branch_to_nodes.items():
                                 if (frm == father_node_id and to == neighbor) or \
-                                   (frm == hidden_neighbor and to == father_node_id):
+                                   (frm == neighbor and to == father_node_id):
                                     if branch_id in edge_features:
-                                        fc_attr.append(edge_features[branch_id])
+                                        # Convert 6-feature format to 4-feature 
+                                        current_features = edge_features[branch_id]
+                                        
+                                        # Extract phase A current components
+                                        i_mag = current_features[0]
+                                        i_ang = current_features[1]
+                                        i_real, i_imag = self._parse_complex_from_mag_ang(i_mag, i_ang)
+                                        
+                                        # Calculate voltage difference if both nodes have features
+                                        if father_node_id in node_features and neighbor in node_features:
+                                            from_v_real = node_features[father_node_id][0]
+                                            from_v_imag = node_features[father_node_id][1]
+                                            to_v_real = node_features[neighbor][0]
+                                            to_v_imag = node_features[neighbor][1]
+                                            
+                                            vdiff_real = from_v_real - to_v_real
+                                            vdiff_imag = from_v_imag - to_v_imag
+                                            
+                                            # Calculate complex power S = V * I*
+                                            s_real = from_v_real * i_real + from_v_imag * i_imag
+                                            s_imag = from_v_imag * i_real - from_v_real * i_imag
+                                        else:
+                                            # Default values if voltage data not available
+                                            vdiff_real = 0.01
+                                            vdiff_imag = 0.01
+                                            s_real = 0.1
+                                            s_imag = 0.05
+                                        
+                                        fc_attr.append([vdiff_real, vdiff_imag, s_real, s_imag])
                                         found_edge = True
                                         break
                             
